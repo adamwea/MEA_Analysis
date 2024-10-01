@@ -722,8 +722,9 @@ def benshalom_kilosort2_docker_image(recording, output_folder, sorting_params=No
             'minFR': 0.01,
             'minfr_goodchannels': 0.01,
             'keep_good_only': False,
-            'do_correction': False
+            #'do_correction': False
         })
+        #sorting_params.to_list()
     else:
         default_params = ss.Kilosort2Sorter.default_params()
         default_params.update(sorting_params)

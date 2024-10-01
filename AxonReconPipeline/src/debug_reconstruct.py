@@ -1,6 +1,8 @@
 from pathlib import Path
 import numpy as np
 import os
+import axon_velocity as av
+import matplotlib.pyplot as plt
 
 toy_data_dir = r"C:\Users\sravy\OneDrive\Documents\MEA_Analysis\MEA_Analysis\AxonReconPipeline\toy_data_for_development\240402_M07037_well003_HOM_KCNT1_Templates"
 
@@ -39,47 +41,85 @@ input_params = {
     'min_outlier_tracking_error': 40.0
 }
 
-# List of specific units to process, add more later 
-units_to_process = [2, 3, 8, 14]
+toy_template = np.load(toy_data_dir + '/485.npy')
+toy_template_dvdt = np.load(toy_data_dir + '/485_dvdt.npy')
+toy_locs = np.load(toy_data_dir + '/485_channels.npy')
 
-# Prepare the templates dictionary for the selected units
-templates = {
-    'date': '240322',  # Date of the experiment
-    'chip_id': 'M07037',  # Chip ID
-    'scanType': 'AxonTracking',  # Scan type
-    'run_id': '000025',  # Run ID
-    'streams': {
-        'well000': {  # Well ID
-            'units': {}
-        }
-    }
-}
+# from func_analyze_and_reconstruct import approx_milos_tracking, transform_data
+# transformed_template, _, trans_loc, _ = transform_data(toy_template, toy_locs)
+# transformed_template_dvdt, _, trans_loc, _ = transform_data(toy_template_dvdt, toy_locs)
 
-# Load data for each selected unit and update the templates dictionary
-for unit in units_to_process:
-    try:
-        template = np.load(toy_data_dir + f'/{unit}.npy')
-        template_dvdt = np.load(toy_data_dir + f'/{unit}_dvdt.npy')
-        locations = np.load(toy_data_dir + f'/{unit}_channels.npy')
-        template_filled = np.load(toy_data_dir + f'/{unit}_filled.npy')
-        locations_filled = np.load(toy_data_dir + f'/{unit}_channels_filled.npy')
+# sampling_frequency = 10000 #Hz
 
-        # Update the templates dictionary with the loaded data
-        templates['streams']['well000']['units'][unit] = {
-            'merged_template': template,
-            'dvdt_merged_template': template_dvdt,
-            'merged_channel_loc': locations,
-            'merged_template_filled': template_filled,
-            'merged_channel_locs_filled': locations_filled
-        }
-    except FileNotFoundError:
-        print(f"Files for unit {unit} not found. Skipping this unit.")
+# # Running Buccino Algorithm on v(t) template
+# gtr_vt = av.compute_graph_propagation_velocity(
+#     template=transformed_template,
+#     locations=trans_loc,
+#     fs=sampling_frequency,
+#     **input_params
+# )
 
-from func_analyze_and_reconstruct import analyze_and_reconstruct
+# # Running Buccino Algorithm on dv/dt template
+# gtr_dvdt = av.compute_graph_propagation_velocity(
+#     template=transformed_template_dvdt,
+#     locations=trans_loc,
+#     fs=sampling_frequency,
+#     **input_params
+# )
 
-if __name__ == '__main__':
-    # Update kwargs as needed
-    kwargs = {
-        'n_jobs': 4,
-    }
-    analyze_and_reconstruct(templates, params=input_params, recon_dir=output_dir, **kwargs)
+# from func_analyze_and_reconstruct import generate_buccino_reconstructions
+# generate_buccino_reconstructions(gtr_vt, output_dir, unit_id=485, suffix="vt")
+# generate_buccino_reconstructions(gtr_dvdt, output_dir, unit_id=485, suffix="dvdt")
+
+
+#Milos recon debugging
+from func_analyze_and_reconstruct import approx_milos_tracking, transform_data
+transformed_template, _, trans_loc, _ = transform_data(toy_template, toy_locs)
+transformed_template_dvdt, _, trans_loc, _ = transform_data(toy_template_dvdt, toy_locs)
+approx_milos_tracking(transformed_template_dvdt, trans_loc, input_params, output_dir, fresh_plots=True)
+
+
+# # List of specific units to process, add more later 
+# units_to_process = [2, 3, 8, 14]
+
+# # Prepare the templates dictionary for the selected units
+# templates = {
+#     'date': '240322',  # Date of the experiment
+#     'chip_id': 'M07037',  # Chip ID
+#     'scanType': 'AxonTracking',  # Scan type
+#     'run_id': '000025',  # Run ID
+#     'streams': {
+#         'well000': {  # Well ID
+#             'units': {}
+#         }
+#     }
+# }
+
+# # Load data for each selected unit and update the templates dictionary
+# for unit in units_to_process:
+#     try:
+#         template = np.load(toy_data_dir + f'/{unit}.npy')
+#         template_dvdt = np.load(toy_data_dir + f'/{unit}_dvdt.npy')
+#         locations = np.load(toy_data_dir + f'/{unit}_channels.npy')
+#         template_filled = np.load(toy_data_dir + f'/{unit}_filled.npy')
+#         locations_filled = np.load(toy_data_dir + f'/{unit}_channels_filled.npy')
+
+#         # Update the templates dictionary with the loaded data
+#         templates['streams']['well000']['units'][unit] = {
+#             'merged_template': template,
+#             'dvdt_merged_template': template_dvdt,
+#             'merged_channel_loc': locations,
+#             'merged_template_filled': template_filled,
+#             'merged_channel_locs_filled': locations_filled
+#         }
+#     except FileNotFoundError:
+#         print(f"Files for unit {unit} not found. Skipping this unit.")
+
+# from func_analyze_and_reconstruct import analyze_and_reconstruct
+
+# if __name__ == '__main__':
+#     # Update kwargs as needed
+#     kwargs = {
+#         'n_jobs': 4,
+#     }
+#     analyze_and_reconstruct(templates, params=input_params, recon_dir=output_dir, **kwargs)

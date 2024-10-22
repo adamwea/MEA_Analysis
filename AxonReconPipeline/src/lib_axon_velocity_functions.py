@@ -34,11 +34,15 @@ def get_stream_ids(h5_file_path):
     h5 = h5py.File(h5_file_path, 'r')
     return list(h5['wells'].keys())
 
-def transform_data(merged_template, merged_channel_loc, merged_template_filled, merged_channel_filled_loc):
+#i made a change to transform_data. I made the last two parameters = none and commented out their respective things in the function
+# i do this such that i only have to input two templates in transform_data 
+def transform_data(merged_template, merged_channel_loc, merged_template_filled = None, merged_channel_filled_loc = None):
     transformed_template = merged_template.T #array with time samples and amplitude values (voltage or v/s)
-    transformed_template_filled = merged_template_filled.T #array with time samples and amplitude values (voltage or v/s)
+    transformed_template_filled = None
+    #transformed_template_filled = merged_template_filled.T #array with time samples and amplitude values (voltage or v/s)
     trans_loc = np.array([[loc[0], loc[1]*-1] for loc in merged_channel_loc])
-    trans_loc_filled = np.array([[loc[0], loc[1]*-1] for loc in merged_channel_filled_loc])
+    #trans_loc_filled = np.array([[loc[0], loc[1]*-1] for loc in merged_channel_filled_loc])
+    trans_loc_filled = None
     return transformed_template, transformed_template_filled, trans_loc, trans_loc_filled
 
 def create_plot_dir(recon_dir, unit_id):

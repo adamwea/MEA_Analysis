@@ -22,8 +22,483 @@ import time
 from .helper import indent_mode_on, indent_mode_off, indent_increase, indent_decrease
 import spikeinterface.postprocessing as spost
 import spikeinterface.full as si
+from scipy.linalg import pinv
+from scipy.spatial.distance import cdist
 
 # Functions ===================================================================
+def compute_HFBursting_metrics(network_data, kwargs):
+
+    """ 
+    compute how many regular bursts are within mega/hyper bursts
+    
+    this is an extrapolation of what is done in: (van Hugte et al., 2023)
+
+    There the calculation is basically done like so:
+
+        🔍 How HFBs Are Calculated (per Methods section):
+
+        Initial Burst Detection:
+
+            Spikes are first detected using a threshold of ±4.5 standard deviations from noise baseline.
+
+            A burst is defined as:
+
+                ≥4 spikes
+
+                ISI ≤ 50 ms (to start/end burst)
+
+                IBI ≥ 100 ms (to distinguish separate bursts)
+
+        Network Bursts (NBs):
+
+            An NB is when ≥50% of active electrodes show temporally overlapping bursts.
+
+        High-Frequency Burst (HFB) Definition:
+
+            Within the NB period, HFBs are identified by tightening the burst detection criteria:
+
+                ISI ≤ 5 ms (very fast spiking)
+
+                Inter-HFB-interval ≤ 10 ms to group spikes into a single HFB
+
+                Multiple HFBs can occur within one NB
+
+        HFB Quantification:
+
+            Count the number of HFBs within each NB
+
+            Summarize per well or per condition
+
+            Performed using a custom MATLAB script
+    
+    In the case of this function, it just gets the number of regular bursts that are within mega bursts
+
+    TODO: Consider adjusting regular and mega burst detection parameters to match the above paper
+
+    """
+    def validate_bursting_inputs(network_data):
+        """Validate presence of regular and mega bursting data."""
+        reg_metrics = network_data.get('bursting_data', {}).get('burst_metrics', {})
+        mega_metrics = network_data.get('mega_bursting_data', {}).get('burst_metrics', {})
+        reg_parts = reg_metrics.get('burst_parts')
+        mega_parts = mega_metrics.get('burst_parts')
+
+        if not all([reg_parts, mega_parts]):
+            return None, None, "Missing bursting parts in network_data"
+
+        return reg_parts, mega_parts, None
+
+    def map_reg_bursts_within_mega(reg_parts, mega_parts):
+        """Map regular bursts that fall completely within each mega burst."""
+        return {
+            mega_id: [
+                reg_id for reg_id, reg_burst in reg_parts.items()
+                if reg_burst['burst_start'] >= mega['burst_start']
+                and reg_burst['burst_end'] <= mega['burst_end']
+            ]
+            for mega_id, mega in mega_parts.items()
+        }
+
+    def compute_burst_count_metrics(reg_in_mega_by_mega):
+        """Compute summary statistics for number of regular bursts per mega burst."""
+        counts = [len(bursts) for bursts in reg_in_mega_by_mega.values()]
+        return {
+            'data': counts,
+            'mean': np.mean(counts),
+            'std': np.std(counts),
+            'median': np.median(counts),
+            'min': np.min(counts),
+            'max': np.max(counts),
+            'cov': np.std(counts) / np.mean(counts) if np.mean(counts) > 0 else np.nan,
+        }
+
+    def compute_burst_rate_metrics(reg_in_mega_by_mega, mega_parts):
+        """Compute HFB rate (reg bursts / mega burst duration) and summary stats."""
+        rates = []
+        for mega_id, reg_bursts in reg_in_mega_by_mega.items():
+            mega = mega_parts[mega_id]
+            duration = mega['burst_end'] - mega['burst_start']
+            rates.append(len(reg_bursts) / duration if duration > 0 else 0)
+
+        return {
+            'data': rates,
+            'mean': np.mean(rates),
+            'std': np.std(rates),
+            'median': np.median(rates),
+            'min': np.min(rates),
+            'max': np.max(rates),
+            'cov': np.std(rates) / np.mean(rates) if np.mean(rates) > 0 else np.nan,
+        }
+
+    def compute_presence_fraction(counts):
+        """Compute fraction of mega bursts that contain ≥1 regular burst."""
+        if not counts:
+            return np.nan
+        return sum(c > 0 for c in counts) / len(counts)
+
+    def compute_avg_reg_burst_durations(reg_in_mega_by_mega, reg_parts):
+        """Compute average duration of regular bursts per mega burst."""
+        avg_durations = []
+        for reg_ids in reg_in_mega_by_mega.values():
+            durations = [
+                reg_parts[reg_id]['burst_end'] - reg_parts[reg_id]['burst_start']
+                for reg_id in reg_ids
+            ]
+            avg_durations.append(np.mean(durations) if durations else 0)
+
+        return {
+            'data': avg_durations,
+            'mean': np.mean(avg_durations),
+            'std': np.std(avg_durations),
+            'median': np.median(avg_durations),
+            'min': np.min(avg_durations),
+            'max': np.max(avg_durations),
+            'cov': np.std(avg_durations) / np.mean(avg_durations) if np.mean(avg_durations) > 0 else np.nan,
+        }
+
+    def compute_reg_ibi_within_mega_bursts(reg_in_mega_by_mega, reg_parts):
+        """
+        Compute inter-burst intervals (IBIs) of regular bursts that fall within each mega burst.
+        """
+        ibi_data = []
+        for reg_ids in reg_in_mega_by_mega.values():
+            if len(reg_ids) < 2:
+                continue
+            start_times = sorted(reg_parts[reg_id]['burst_start'] for reg_id in reg_ids)
+            ibis = np.diff(start_times)
+            ibi_data.extend(ibis)
+
+        if not ibi_data:
+            return {
+                'data': [],
+                'mean': np.nan,
+                'std': np.nan,
+                'median': np.nan,
+                'min': np.nan,
+                'max': np.nan,
+                'cov': np.nan
+            }
+
+        ibis_array = np.array(ibi_data)
+        mean_ibi = np.mean(ibis_array)
+        std_ibi = np.std(ibis_array)
+        return {
+            'data': ibi_data,
+            'mean': mean_ibi,
+            'std': std_ibi,
+            'median': np.median(ibis_array),
+            'min': np.min(ibis_array),
+            'max': np.max(ibis_array),
+            'cov': std_ibi / mean_ibi if mean_ibi > 0 else np.nan
+        }
+
+    def compute_HFB_metrics_by_unit(reg_parts, reg_in_mega_by_mega, network_data):
+        """
+        Compute HFB metrics per unit, including count and scaffold for additional metrics.
+        
+        Each unit is counted once per regular burst (inside a mega burst) it participates in.
+        """
+        hfb_metrics_by_unit = {}
+
+        # Gather all reg bursts that are part o f mega bursts
+        reg_ids_in_megas = {reg_id for reg_list in reg_in_mega_by_mega.values() for reg_id in reg_list}
+
+        for reg_id in reg_ids_in_megas:
+            participating_units = reg_parts[reg_id].get('participating_units', [])
+            for unit_id in participating_units:
+                if unit_id not in hfb_metrics_by_unit:
+                    hfb_metrics_by_unit[unit_id] = {
+                        'count': 0,
+                        # Scaffold: add more metrics here (e.g., fr_in_hfb, fr_outside_hfb)
+                    }
+                hfb_metrics_by_unit[unit_id]['count'] += 1
+
+        # Convert counts to summary stats
+        count_values = [metrics['count'] for metrics in hfb_metrics_by_unit.values()]
+
+        # add zero counts for units not in reg_ids_in_megas
+        all_unit_ids = network_data.get('unit_ids', [])
+        for unit_id in all_unit_ids:
+            if unit_id not in hfb_metrics_by_unit:
+                hfb_metrics_by_unit[unit_id] = {'count': 0}
+                count_values.append(0)
+
+        count_array = np.array(count_values)
+
+        unit_hfb_counts = {
+            'data': count_values,
+            'mean': np.mean(count_array) if len(count_array) else np.nan,
+            'std': np.std(count_array) if len(count_array) else np.nan,
+            'median': np.median(count_array) if len(count_array) else np.nan,
+            'min': np.min(count_array) if len(count_array) else np.nan,
+            'max': np.max(count_array) if len(count_array) else np.nan,
+            'cov': np.std(count_array) / np.mean(count_array) if np.mean(count_array) > 0 else np.nan,
+        }
+
+        return {
+            'hfb_metrics_by_unit': hfb_metrics_by_unit,
+            'unit_hfb_counts': unit_hfb_counts
+        }
+
+
+
+    """
+    Compute high-frequency bursting (HFB) metrics: regular bursts within mega bursts.
+    """
+    reg_parts, mega_parts, error = validate_bursting_inputs(network_data)
+    if error:
+        print(f"⚠️ {error}")
+        network_data['HFBursting_metrics'] = error
+        return network_data
+
+    reg_in_mega_by_mega = map_reg_bursts_within_mega(reg_parts, mega_parts)
+    HFB_count = compute_burst_count_metrics(reg_in_mega_by_mega)
+    HFB_rate = compute_burst_rate_metrics(reg_in_mega_by_mega, mega_parts)
+    HFB_presence_fraction = compute_presence_fraction(HFB_count['data'])
+    avg_durations = compute_avg_reg_burst_durations(reg_in_mega_by_mega, reg_parts)
+    reg_ibi_stats = compute_reg_ibi_within_mega_bursts(reg_in_mega_by_mega, reg_parts)
+    #unit_hfb_participation = compute_unit_participation_in_HFBs(reg_parts, reg_in_mega_by_mega)
+    hfb_unit_metrics = compute_HFB_metrics_by_unit(reg_parts, reg_in_mega_by_mega, network_data)
+
+
+    network_data['HFBursting_metrics'] = {
+        'reg_in_mega_by_mega': reg_in_mega_by_mega,
+        'HFB_count': HFB_count,
+        'HFB_rate': HFB_rate,
+        'HFB_presence_fraction': HFB_presence_fraction,
+        'avg_reg_burst_duration_in_mega': avg_durations,
+        'reg_IBI_within_mega': reg_ibi_stats,
+    }
+
+    return network_data
+
+def interpolate_and_smooth(unit_wfs, num_interp_samples, sigma=9):
+    """Interpolate and apply Gaussian smoothing to waveforms."""
+    num_samples = unit_wfs.shape[1]
+    x = np.arange(num_samples)
+    x_new = np.linspace(0, num_samples - 1, num_interp_samples)
+    interpolated = np.stack([np.interp(x_new, x, wf) for wf in unit_wfs])
+    smoothed = gaussian_filter1d(interpolated, sigma=sigma, axis=1)
+    return smoothed
+
+def compute_mahalanobis_weights(waveforms, mean_vector):
+    """Compute Mahalanobis distances and corresponding weights."""
+    covariance = np.cov(waveforms, rowvar=False)
+    inv_covariance = pinv(covariance)
+    distances = cdist(waveforms, [mean_vector], metric='mahalanobis', VI=inv_covariance).flatten()
+    weights = np.exp(-distances / np.nanmedian(distances))
+    return weights, inv_covariance
+
+def compute_smearing_metrics(waveforms, time_conversion_factor):
+    """Calculate vertical and horizontal smearing metrics."""
+    vertical_std = np.std(waveforms, axis=0)
+    peak_amplitudes = np.max(waveforms, axis=1)
+    trough_amplitudes = np.min(waveforms, axis=1)
+    peak_to_trough = peak_amplitudes - trough_amplitudes
+
+    vertical_smearing = {
+        "std_across_time": vertical_std,
+        "cv_peak_amplitude": np.std(peak_amplitudes) / np.mean(peak_amplitudes),
+        "cv_trough_amplitude": np.std(trough_amplitudes) / np.mean(trough_amplitudes),
+        "peak_to_trough_variance": np.var(peak_to_trough),
+    }
+
+    trough_times = np.argmin(waveforms, axis=1)
+    peak_times = np.array([np.argmax(wf[tt:]) + tt for wf, tt in zip(waveforms, trough_times)])
+
+    horizontal_smearing = {
+        "trough_time_std_ms": np.std(trough_times) * time_conversion_factor,
+        "peak_time_std_ms": np.std(peak_times) * time_conversion_factor,
+        "trough_to_peak_jitter_ms": np.std(peak_times - trough_times) * time_conversion_factor,
+    }
+
+    return vertical_smearing, horizontal_smearing, trough_times, peak_times
+
+def compute_zero_crossings(weighted_avg_wf, trough_idx):
+    """Identify key waveform phase markers using zero-crossings."""
+    zero_crossings = np.flatnonzero(np.diff(np.signbit(weighted_avg_wf)))
+    ap_start_idx = zero_crossings[zero_crossings < trough_idx][-1] if len(zero_crossings[zero_crossings < trough_idx]) > 0 else 0
+    ap_end_idx = zero_crossings[zero_crossings > trough_idx][0] if len(zero_crossings[zero_crossings > trough_idx]) > 0 else len(weighted_avg_wf) - 1
+    refractory_end_idx = zero_crossings[zero_crossings > ap_end_idx][0] if len(zero_crossings[zero_crossings > ap_end_idx]) > 0 else len(weighted_avg_wf) - 1
+    return ap_start_idx, ap_end_idx, refractory_end_idx
+
+def compute_waveform_features(
+    weighted_avg_wf, trough_idx, peak_idx,
+    ap_start_idx, ap_end_idx, refractory_end_idx,
+    time_conversion_factor, sampling_duration
+    ):
+    # Cache global waveform stats
+    wf_mean = np.mean(weighted_avg_wf)
+    wf_std = np.std(weighted_avg_wf)
+
+    # Amplitudes
+    peak_amp = weighted_avg_wf[peak_idx]
+    trough_amp = weighted_avg_wf[trough_idx]
+    pt_amp = abs(peak_amp) + abs(trough_amp)
+
+    # Time metrics
+    pt_time = (peak_idx - trough_idx) * time_conversion_factor
+    ap_dur = (ap_end_idx - ap_start_idx) * time_conversion_factor
+    ref_dur = (refractory_end_idx - ap_end_idx) * time_conversion_factor
+
+    # Half-max width
+    half_amp = (abs(peak_amp) + abs(trough_amp)) / 2
+    half_max_val = trough_amp + half_amp
+    half_idxs = np.flatnonzero(weighted_avg_wf <= half_max_val)
+    half_width = (half_idxs[-1] - half_idxs[0]) * time_conversion_factor if len(half_idxs) > 1 else np.nan
+
+    # Slopes
+    depol_slope = np.max(np.diff(weighted_avg_wf[:trough_idx])) * (1000 / sampling_duration)
+    repol_slope = np.min(np.diff(weighted_avg_wf[trough_idx:peak_idx])) * (1000 / sampling_duration)
+    slope_ratio = depol_slope / repol_slope
+
+    # Asymmetry
+    wf_dur = sampling_duration
+    tp_ratio = pt_time / wf_dur
+    asym_idx = (pt_time - (wf_dur - pt_time)) / wf_dur
+
+    # Energy
+    ap_power = np.mean(weighted_avg_wf[:trough_idx] ** 2)
+    ref_power = np.mean(weighted_avg_wf[trough_idx:] ** 2)
+    total_power = ap_power + ref_power
+
+    # Shape
+    centered = weighted_avg_wf - wf_mean
+    skewness = np.mean(centered ** 3) / wf_std**3
+    kurtosis = np.mean(centered ** 4) / wf_std**4
+
+    return {
+        'amplitude_metrics': {
+            'peak_amplitude': peak_amp,
+            'trough_amplitude': trough_amp,
+            'peak_to_trough_amplitude': pt_amp,
+        },
+        'temporal_metrics': {
+            'trough_time_ms': trough_idx * time_conversion_factor,
+            'peak_time_ms': peak_idx * time_conversion_factor,
+            'peak_to_trough_time_ms': pt_time,
+            'ap_phase_duration_ms': ap_dur,
+            'ap_start_ms': ap_start_idx * time_conversion_factor,
+            'ap_end_ms': ap_end_idx * time_conversion_factor,
+            'refractory_phase_duration_ms': ref_dur,
+            'refractory_end_ms': refractory_end_idx * time_conversion_factor,
+            'spike_width_half_max_ms': half_width,
+        },
+        'slope_metrics': {
+            'max_depolarization_slope': depol_slope,
+            'max_repolarization_slope': repol_slope,
+            'slope_ratio': slope_ratio,
+        },
+        'waveform_asymmetry': {
+            'trough_to_peak_ratio': tp_ratio,
+            'waveform_asymmetry_index': asym_idx,
+        },
+        'energy_metrics': {
+            'ap_phase_power_uv2': ap_power,
+            'refractory_phase_power_uv2': ref_power,
+            'total_spike_power_uv2': total_power,
+        },
+        'waveform_shape': {
+            'waveform_skewness': skewness,
+            'waveform_kurtosis': kurtosis,
+        }
+    }
+
+def compute_wf_metrics_modular(best_channel_waveforms, sampling_rate, plot_wf=False, save_fig=False, fig_name="waveform_debug.png", unit=None):
+    unit_wfs = best_channel_waveforms
+    num_samples = unit_wfs.shape[1]
+    sampling_duration = num_samples / sampling_rate * 1000  # ms
+    num_interp_samples = 1000
+    time_conversion_factor = sampling_duration / num_interp_samples
+
+    # Step 1: Interpolation & Smoothing
+    interpolated_wfs = interpolate_and_smooth(unit_wfs, num_interp_samples)
+
+    # Step 2: Compute mean and Mahalanobis-based weights
+    mean_vector = np.nanmean(interpolated_wfs, axis=0)
+    if len(interpolated_wfs) < 2:
+        return {'excluded': True, 'reason': 'Not enough waveforms'}
+
+    try:
+        weights, inv_covariance = compute_mahalanobis_weights(interpolated_wfs, mean_vector)
+    except Exception:
+        return {'excluded': True, 'reason': 'Covariance computation failed'}
+
+    weighted_avg_wf = np.average(interpolated_wfs, axis=0, weights=weights)
+
+    # Step 3: Biological Variability
+    weighted_variability = np.average(np.abs(interpolated_wfs - weighted_avg_wf), axis=0, weights=weights)
+    weighted_coefficient_of_variation = weighted_variability / np.abs(weighted_avg_wf)
+    bio_variability_metrics = {
+        'weighted_variability': weighted_variability,
+        'mean_variance': np.mean(weighted_variability),
+        'std_variance': np.std(weighted_variability),
+        'cov_variance': np.std(weighted_variability) / np.mean(weighted_variability),
+        'weighted_coefficient_of_variation': weighted_coefficient_of_variation,
+        'mean_cv': np.mean(weighted_coefficient_of_variation),
+        'std_cv': np.std(weighted_coefficient_of_variation),
+        'cov_cv': np.std(weighted_coefficient_of_variation) / np.mean(weighted_coefficient_of_variation),
+    }
+
+    # Step 4: Smearing metrics
+    vertical_smearing, horizontal_smearing, trough_times, peak_times = compute_smearing_metrics(interpolated_wfs, time_conversion_factor)
+
+    # Step 5: Key points
+    trough_idx = np.argmin(weighted_avg_wf)
+    peak_idx = np.argmax(weighted_avg_wf[trough_idx:]) + trough_idx
+    ap_start_idx, ap_end_idx, refractory_end_idx = compute_zero_crossings(weighted_avg_wf, trough_idx)
+
+    # Step 6: Waveform feature extraction
+    waveform_features = compute_waveform_features(
+        weighted_avg_wf, trough_idx, peak_idx,
+        ap_start_idx, ap_end_idx, refractory_end_idx,
+        time_conversion_factor, sampling_duration
+    )
+
+    # Step 7: Plotting
+    if plot_wf:
+        time_axis = np.linspace(0, sampling_duration, num_interp_samples)
+        plt.figure(figsize=(8, 6))
+
+        plt.subplot(2, 1, 1)
+        plt.plot(time_axis, interpolated_wfs.T, color='gray', alpha=0.75, linewidth=0.25)
+        plt.plot(time_axis, weighted_avg_wf, color='red', linewidth=1.0, label="weighted mean")
+        plt.fill_between(time_axis, weighted_avg_wf - vertical_smearing["std_across_time"],
+                         weighted_avg_wf + vertical_smearing["std_across_time"], color='red', alpha=0.5)
+        plt.title(f"Unit {unit}")
+        plt.legend(fontsize='small')
+        plt.axhline(0, color="black", linestyle="--", alpha=0.5, linewidth=0.5)
+        plt.xlim(0, max(time_axis))
+        plt.tick_params(axis='x', which='both', bottom=False, top=False, labelbottom=False)
+
+        plt.subplot(2, 1, 2)
+        bins = np.linspace(0, max(time_axis), 100)
+        plt.hist(trough_times * time_conversion_factor, bins=bins, color="blue", alpha=0.6, label="trough timing")
+        plt.hist(peak_times * time_conversion_factor, bins=bins, color="green", alpha=0.6, label="peak timing")
+        plt.xlabel("time (ms)")
+        plt.ylabel("spikes")
+        plt.legend(fontsize='small')
+        plt.xlim(0, max(time_axis))
+        plt.tight_layout()
+
+        if save_fig:
+            fig_dir = os.path.dirname(fig_name)
+            if not os.path.exists(fig_dir):
+                os.makedirs(fig_dir)
+            plt.savefig(fig_name, dpi=300)
+            plt.savefig(fig_name.replace('.png', '.pdf'))
+        else:
+            plt.show()
+        plt.close()
+
+    return {
+        'weighted_avg_wf': weighted_avg_wf,
+        'bio_variability_metrics': bio_variability_metrics,
+        **waveform_features,
+        'vertical_smearing': vertical_smearing,
+        'horizontal_smearing': horizontal_smearing,
+    }
+
 def plot_network_summary_v3(network_data, x_lim=None, y_lim=None, **kwargs):
     """
     Plot a 2-panel or 3-panel summary of network data,
@@ -157,12 +632,40 @@ def plot_network_summary_v3(network_data, x_lim=None, y_lim=None, **kwargs):
         # apply overrides if given
         if x_lim is not None:
             for ax in axs:
+                # Set x limits as before
                 ax.set_xlim(*x_lim)
+                
+        # For y limits, if y_lim is specified, check if any data exceeds y_lim[1]
         if y_lim is not None:
             for ax in axs:
                 if ax == axs[0]:
                     continue
+
+                # Set initial y-limits
                 ax.set_ylim(*y_lim)
+
+                # Find max y-value across all lines
+                max_y = None
+                for line in ax.get_lines():
+                    ydata = line.get_ydata()
+                    ydata = np.asarray(line.get_ydata())  # Ensures compatibility
+                    if ydata.size > 0:
+                        this_max = np.nanmax(ydata)
+                        if max_y is None or this_max > max_y:
+                            max_y = this_max
+
+                # Check if it exceeds y_lim[1]
+                if max_y is not None and max_y > y_lim[1]:
+                    # Extend the y-limit just above the max_y
+                    padding = 0.05 * abs(max_y - y_lim[0])  # small buffer
+                    new_ylim_top = max_y + padding
+                    # round up to whole number
+                    new_ylim_top = np.ceil(new_ylim_top)
+                    ax.set_ylim(y_lim[0], new_ylim_top)
+
+                    # Draw red line at original upper limit
+                    ax.axhline(y=y_lim[1], color='red', linestyle='-', linewidth=1.5, label='original y max limit')
+
 
         # apply time limit zoom
         if limit_seconds is not None:
@@ -206,12 +709,38 @@ def plot_network_summary_v3(network_data, x_lim=None, y_lim=None, **kwargs):
         if x_lim is not None:
             for ax in axs:
                 ax.set_xlim(*x_lim)
+
+        # For y limits, if y_lim is specified, check if any data exceeds y_lim[1]
         if y_lim is not None:
             for ax in axs:
                 if ax == axs[0]:
                     continue
+
+                # Set initial y-limits
                 ax.set_ylim(*y_lim)
 
+                # Find max y-value across all lines
+                max_y = None
+                for line in ax.get_lines():
+                    ydata = line.get_ydata()
+                    ydata = np.asarray(line.get_ydata())  # Ensures compatibility
+                    if ydata.size > 0:
+                        this_max = np.nanmax(ydata)
+                        if max_y is None or this_max > max_y:
+                            max_y = this_max
+
+                # Check if it exceeds y_lim[1]
+                if max_y is not None and max_y > y_lim[1]:
+                    # Extend the y-limit just above the max_y
+                    padding = 0.05 * abs(max_y - y_lim[0])  # small buffer
+                    new_ylim_top = max_y + padding
+                    # round up to whole number
+                    new_ylim_top = np.ceil(new_ylim_top)
+                    ax.set_ylim(y_lim[0], new_ylim_top)
+
+                    # Draw red line at original upper limit
+                    ax.axhline(y=y_lim[1], color='red', linestyle='-', linewidth=1.5, label='original y max limit')
+                    
         # apply time limit zoom
         if limit_seconds is not None:
             for ax in axs:
@@ -705,7 +1234,113 @@ def compute_bursting_metrics(network_data, kwargs):
     
     return network_data
 
-def compute_unit_spike_metrics(
+def compute_firing_rate(spike_times):
+    try:
+        if len(spike_times) > 1:
+            return len(spike_times) / (spike_times[-1] - spike_times[0])
+    except Exception as e:
+        print(f"⚠️ Error computing firing rate: {e}")
+    return np.nan
+
+def compute_isi_metrics(spike_times):
+    isi_diffs = np.diff(spike_times) if len(spike_times) > 1 else np.array([])
+    if isi_diffs.size == 0:
+        return {
+            'data': isi_diffs,
+            'mean': np.nan, 'std': np.nan, 'median': np.nan,
+            'cov': np.nan, 'max': np.nan, 'min': np.nan
+        }
+    try:
+        mean = np.nanmean(isi_diffs)
+        return {
+            'data': isi_diffs,
+            'mean': mean,
+            'std': np.nanstd(isi_diffs),
+            'median': np.nanmedian(isi_diffs),
+            'cov': np.nanstd(isi_diffs) / mean if mean > 0 else np.nan,
+            'max': np.nanmax(isi_diffs),
+            'min': np.nanmin(isi_diffs)
+        }
+    except Exception as e:
+        print(f"⚠️ Error computing ISI stats: {e}")
+        return {
+            'data': isi_diffs,
+            'mean': np.nan, 'std': np.nan, 'median': np.nan,
+            'cov': np.nan, 'max': np.nan, 'min': np.nan
+        }
+
+def load_best_channel_waveforms(sa, unit):
+    try:
+        unit_wfs = sa.get_extension("waveforms").get_waveforms_one_unit(unit)
+        avg_waveform = np.nanmean(unit_wfs, axis=0)
+        best_channel_idx = np.argmax(np.max(np.abs(avg_waveform), axis=0))
+        return unit_wfs[:, :, best_channel_idx]
+    except Exception as e:
+        print(f"⚠️ Error loading waveform data: {e}")
+        return None
+
+def compute_waveform_metrics_safe(waveforms, sampling_rate, unit, plot_wf, sa_well_folder):
+    try:
+        fig_path = sa_well_folder.replace('analyzer', 'wf_plots') + f"/unit_{unit}_waveforms.png"
+        return compute_wf_metrics_modular(
+            waveforms, sampling_rate,
+            plot_wf=plot_wf, save_fig=True,
+            unit=unit, fig_name=fig_path
+        )
+    except Exception as e:
+        print(f"⚠️ Error computing waveform metrics: {e}")
+        return 'Error computing waveform metrics'
+
+def compute_unit_spike_metrics(unit, spike_times_by_unit, sampling_rate, plot_wfs, recording_object, sorting_object, sa_well_folder, **pkwargs):
+    print(f'Processing unit {unit}...')
+
+    spike_times = spike_times_by_unit.get(unit, np.array([]))
+    num_spikes = len(spike_times)
+
+    fr = compute_firing_rate(spike_times)
+    isi_metrics = compute_isi_metrics(spike_times)
+
+    if sa_well_folder is None:
+        return unit, {
+            'num_spikes': num_spikes,
+            'wf_metrics': 'Not implemented...yet',
+            'fr': fr,
+            'isi': isi_metrics,
+            'spike_times': spike_times,
+        }
+
+    try:
+        sa = si.load_sorting_analyzer(sa_well_folder)
+        best_channel_waveforms = load_best_channel_waveforms(sa, unit)
+        if best_channel_waveforms is None:
+            return unit, {
+                'num_spikes': num_spikes,
+                'wf_metrics': 'Error loading waveform data',
+                'fr': fr,
+                'isi': isi_metrics,
+                'spike_times': spike_times,
+            }
+
+        wf_metrics = compute_waveform_metrics_safe(
+            best_channel_waveforms, sampling_rate,
+            unit, plot_wfs, sa_well_folder
+        )
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f'❌ Fatal error in waveform computation for unit {unit}: {e}')
+        wf_metrics = 'Error computing waveform metrics'
+
+    return unit, {
+        'num_spikes': num_spikes,
+        'wf_metrics': wf_metrics,
+        'fr': fr,
+        'isi': isi_metrics,
+        'spike_times': spike_times,
+    }
+
+def compute_unit_spike_metrics_dep2(
     unit, 
     spike_times_by_unit, 
     sampling_rate, 
@@ -782,7 +1417,7 @@ def compute_unit_spike_metrics(
 
         try:
             unit_wf_path = sa_well_folder.replace('analyzer', 'wf_plots') + f"/unit_{unit}_waveforms.png"
-            wf_metrics = compute_wf_metrics(
+            wf_metrics = compute_wf_metrics_modular(
                 best_channel_waveforms,
                 sampling_rate,
                 plot_wf=plot_wfs,
@@ -888,7 +1523,7 @@ def compute_unit_spike_metrics_dep(
         print(f'Error processing unit {unit}: {e}')
         return unit, None  # Return None in case of an error
 
-def compute_spike_metrics_by_unit(network_data, kwargs):
+def compute_spike_metrics_by_unit_dep(network_data, kwargs):
     """Parallelized function to extract spiking metrics from experimental data using ThreadPoolExecutor."""    
     
     # Subfunctions =============================================================
@@ -1066,6 +1701,87 @@ def compute_spike_metrics_by_unit(network_data, kwargs):
         indent_decrease()
         return network_data
 
+def process_unit_wrapper(unit, pkwargs):
+    try:
+        return compute_unit_spike_metrics(unit, **pkwargs)
+    except Exception as e:
+        print(f"Error processing unit {unit}: {e}")
+        return unit, None
+
+def compute_spike_metrics_by_unit(network_data, kwargs):
+    from concurrent.futures import ThreadPoolExecutor, as_completed  # safer than ProcessPool in many I/O-heavy cases
+
+    def get_units_and_analyzer(source, network_data, kwargs):
+        sorting_analyzer = kwargs.get('sorting_analyzer', None)
+        if source == 'experimental':
+            if sorting_analyzer is None:
+                raise ValueError("No sorting analyzer provided for experimental data.")
+            units = kwargs['sorting_object'].get_unit_ids()
+            network_data['unit_ids'] = units
+        elif source == 'simulated':
+            units = [int(i['gid']) for i in kwargs['cellData']]
+            network_data['gids'] = units
+        else:
+            raise ValueError("Unknown data source.")
+        return units, sorting_analyzer
+
+    print("⚡ Computing spiking metrics by unit...")
+    source = network_data['source']
+    debug_mode = kwargs.get('debug_mode', False)
+    run_parallel = kwargs.get('run_parallel', False)
+    max_workers = kwargs.get('max_workers', 4)
+    
+    try:
+        units, sorting_analyzer = get_units_and_analyzer(source, network_data, kwargs)
+        if debug_mode:
+            print("Debug mode enabled: limiting to 10 units.")
+            units = units[:10]
+            max_workers = min(10, len(units))
+
+        pkwargs = {
+            'spike_times_by_unit': network_data['spiking_data']['spiking_times_by_unit'],
+            'sa_well_folder': sorting_analyzer.folder._str if sorting_analyzer else None,
+            'sampling_rate': network_data['sampling_rate'],
+            'plot_wfs': kwargs.get('plot_wfs', False) if source == 'experimental' else False,
+            'recording_object': kwargs.get('recording_object'),
+            'sorting_object': kwargs.get('sorting_object'),
+        }
+
+        results = {}
+        if run_parallel:
+            print(f"🚀 Running in parallel with {max_workers} workers...")
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(process_unit_wrapper, unit, pkwargs): unit for unit in units}
+                for future in as_completed(futures):
+                    unit, result = future.result()
+                    if result:
+                        results[unit] = result
+
+            #do parallel processeses instead of threads
+            # print(f"🚀 Running in parallel with {max_workers} workers...")
+            # with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            #     futures = {executor.submit(process_unit_wrapper, unit, pkwargs): unit for unit in units}
+            #     for future in as_completed(futures):
+            #         unit, result = future.result()
+            #         if result:
+            #             results[unit] = result
+        else:
+            print("🔁 Running sequentially...")
+            for unit in units:
+                unit_id, result = process_unit_wrapper(unit)
+                if result:
+                    results[unit_id] = result
+
+        network_data['spiking_data']['spiking_metrics_by_unit'] = results
+        print("✅ Spiking metrics by unit computed.")
+        return network_data
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"❌ Error in compute_spike_metrics_by_unit: {e}")
+        return network_data
+
 def compute_network_metrics(conv_params, mega_params, source, **kwargs):
     '''
     Get network metrics for simulated or experimental data.
@@ -1234,6 +1950,10 @@ def compute_network_metrics(conv_params, mega_params, source, **kwargs):
             #pass
             return None, None, None, network_data
     
+    # def compute_baseline(network_data, kwargs):
+    #     '''Compute baseline activity in the network.'''
+    #     print("⚡ Computing waveform metrics...")
+
     def compute_spike_metrics(network_data, kwargs):
 
         #extract spiking metrics from either simulated or experimental data
@@ -1320,7 +2040,7 @@ def compute_network_metrics(conv_params, mega_params, source, **kwargs):
             'min': np.nanmin(frs) if len(frs) > 0 else None,
         }
         
-        # E/U frs
+        # E/I/U frs
         unit_types = network_data['unit_types']
         i_frs = [metrics['fr'] for i, metrics in spiking_data['spiking_metrics_by_unit'].items() if i in unit_types and unit_types[i] == 'I']
         e_frs = [metrics['fr'] for i, metrics in spiking_data['spiking_metrics_by_unit'].items() if i in unit_types and unit_types[i] == 'E']
@@ -1355,6 +2075,130 @@ def compute_network_metrics(conv_params, mega_params, source, **kwargs):
             'max': np.nanmax(u_frs) if len(u_frs) > 0 else None,
             'min': np.nanmin(u_frs) if len(u_frs) > 0 else None,
         }
+
+        # unit spiking summary metrics
+        #sim_spike_data = simulated_metrics.get('spiking_data', {})
+        sim_spike_data = network_data['spiking_data']
+        e_frs = sim_spike_data.get('e_frs', {}).get('data', [])
+        i_frs = sim_spike_data.get('i_frs', {}).get('data', [])
+
+        # get number of non-nan values in e_frs and i_frs
+        num_e_frs = np.count_nonzero(~np.isnan(e_frs))
+        num_i_frs = np.count_nonzero(~np.isnan(i_frs))
+        network_data['spiking_data']['num_e_firing'] = num_e_frs
+        network_data['spiking_data']['num_i_firing'] = num_i_frs
+
+        # total expected number of excitatory and inhibitory units
+        tot = len(e_frs) + len(i_frs)
+        total_firing = num_e_frs + num_i_frs
+        network_data['spiking_data']['num_total_firing'] = total_firing
+
+        #E/I total spike ratio
+        # spiking_metrics_by_unit = sim_spike_data.get('spiking_metrics_by_unit', {})
+        # Espikes = 0
+        # Ispikes = 0
+        # for unit, unit_type in network_data.get('unit_types', {}).items():
+        #     if unit_type == 'E':
+        #         # if unit not in e_frs: e_frs.append(unit)
+        #         num_spikes = spiking_metrics_by_unit.get(unit, {}).get('num_spikes', 0)
+        #         Espikes += num_spikes
+        #     elif unit_type == 'I':
+        #         #if unit not in i_frs: i_frs.append(unit)
+        #         num_spikes = spiking_metrics_by_unit.get(unit, {}).get('num_spikes', 0)
+        #         Ispikes += num_spikes
+        # Espikes_per_unit = Espikes / num_e_frs if num_e_frs > 0 else 0
+        # Ispikes_per_unit = Ispikes / num_i_frs if num_i_frs > 0 else 0
+        # spiking_data['E_I_spike_ratio'] = Espikes_per_unit / Ispikes_per_unit if Ispikes_per_unit > 0 else None
+        
+        #E/I/U total spikes NOTE: this data is not super useful unless simulation time = experiment time
+        E_spikes = [metrics['num_spikes'] for i, metrics in spiking_data['spiking_metrics_by_unit'].items() if i in unit_types and unit_types[i] == 'E']
+        I_spikes = [metrics['num_spikes'] for i, metrics in spiking_data['spiking_metrics_by_unit'].items() if i in unit_types and unit_types[i] == 'I']
+        U_spikes = [metrics['num_spikes'] for i, metrics in spiking_data['spiking_metrics_by_unit'].items() if i not in unit_types]
+        E_spikes = [np.nan if i == np.inf else i for i in E_spikes]  # replace inf with nan
+        I_spikes = [np.nan if i == np.inf else i for i in I_spikes]
+        U_spikes = [np.nan if i == np.inf else i for i in U_spikes]
+        spiking_data['E_spikes'] = {
+            'data': E_spikes if len(E_spikes) > 0 else None,
+            'mean': np.nanmean(E_spikes) if len(E_spikes) > 0 else None,
+            'std': np.nanstd(E_spikes) if len(E_spikes) > 0 else None,
+            'median': np.nanmedian(E_spikes) if len(E_spikes) > 0 else None,
+            'cov': np.nanstd(E_spikes) / np.nanmean(E_spikes) if np.nanmean(E_spikes) and len(E_spikes) > 0 else None,
+            'max': np.nanmax(E_spikes) if len(E_spikes) > 0 else None,
+            'min': np.nanmin(E_spikes) if len(E_spikes) > 0 else None,
+        }
+        spiking_data['I_spikes'] = {
+            'data': I_spikes if len(I_spikes) > 0 else None,
+            'mean': np.nanmean(I_spikes) if len(I_spikes) > 0 else None,
+            'std': np.nanstd(I_spikes) if len(I_spikes) > 0 else None,
+            'median': np.nanmedian(I_spikes) if len(I_spikes) > 0 else None,
+            'cov': np.nanstd(I_spikes) / np.nanmean(I_spikes) if np.nanmean(I_spikes) and len(I_spikes) > 0 else None,
+            'max': np.nanmax(I_spikes) if len(I_spikes) > 0 else None,
+            'min': np.nanmin(I_spikes) if len(I_spikes) > 0 else None,
+        }
+        spiking_data['U_spikes'] = {
+            'data': U_spikes if len(U_spikes) > 0 else None,
+            'mean': np.nanmean(U_spikes) if len(U_spikes) > 0 else None,
+            'std': np.nanstd(U_spikes) if len(U_spikes) > 0 else None,
+            'median': np.nanmedian(U_spikes) if len(U_spikes) > 0 else None,
+            'cov': np.nanstd(U_spikes) / np.nanmean(U_spikes) if np.nanmean(U_spikes) and len(U_spikes) > 0 else None,
+            'max': np.nanmax(U_spikes) if len(U_spikes) > 0 else None,
+            'min': np.nanmin(U_spikes) if len(U_spikes) > 0 else None,
+        }
+
+
+        # E/I fr ratio metrics
+        # EI_fr_ratios = {
+        #     'mean': np.nanmean(spiking_data['e_frs']['mean'] / spiking_data['i_frs']['mean']) if spiking_data['e_frs']['mean'] and spiking_data['i_frs']['mean'] else None,
+        #     'std': np.nanstd(spiking_data['e_frs']['mean'] / spiking_data['i_frs']['mean']) if spiking_data['e_frs']['mean'] and spiking_data['i_frs']['mean'] else None,
+        #     'median': np.nanmedian(spiking_data['e_frs']['mean'] / spiking_data['i_frs']['mean']) if spiking_data['e_frs']['mean'] and spiking_data['i_frs']['mean'] else None,
+        #     'cov': np.nanstd(spiking_data['e_frs']['mean'] / spiking_data['i_frs']['mean']) / np.nanmean(spiking_data['e_frs']['mean'] / spiking_data['i_frs']['mean']) if spiking_data['e_frs']['mean'] and spiking_data['i_frs']['mean'] else None,
+        #     'max': np.nanmax(spiking_data['e_frs']['mean'] / spiking_data['i_frs']['mean']) if spiking_data['e_frs']['mean'] and spiking_data['i_frs']['mean'] else None,
+        #     'min': np.nanmin(spiking_data['e_frs']['mean'] / spiking_data['i_frs']['mean']) if spiking_data['e_frs']['mean'] and spiking_data['i_frs']['mean'] else None,
+        # }
+        E_mean = spiking_data['e_frs']['mean']
+        I_mean = spiking_data['i_frs']['mean']
+        E_std = spiking_data['e_frs']['std']
+        I_std = spiking_data['i_frs']['std']
+        E_median = spiking_data['e_frs']['median']
+        I_median = spiking_data['i_frs']['median']
+        E_cov = spiking_data['e_frs']['cov']
+        I_cov = spiking_data['i_frs']['cov']
+        E_max = spiking_data['e_frs']['max']
+        I_max = spiking_data['i_frs']['max']
+        E_min = spiking_data['e_frs']['min']
+        I_min = spiking_data['i_frs']['min']
+        EI_fr_ratios = {
+            'mean': E_mean / I_mean if E_mean is not None and I_mean is not None and I_mean != 0 else None,
+            'std': E_std / I_std if E_std is not None and I_std is not None and I_std != 0 else None,
+            'median': E_median / I_median if E_median is not None and I_median is not None and I_median != 0 else None,
+            'cov': E_cov / I_cov if E_cov is not None and I_cov is not None and I_cov != 0 else None,
+            'max': E_max / I_max if E_max is not None and I_max is not None and I_max != 0 else None,
+            'min': E_min / I_min if E_min is not None and I_min is not None and I_min != 0 else None,
+        }
+        spiking_data['EI_fr_ratios'] = EI_fr_ratios
+
+        #E/I spiking ratio metrics
+        E_spikes_mean = spiking_data['E_spikes']['mean']
+        I_spikes_mean = spiking_data['I_spikes']['mean']
+        E_std = spiking_data['E_spikes']['std']
+        I_std = spiking_data['I_spikes']['std']
+        E_median = spiking_data['E_spikes']['median']
+        I_median = spiking_data['I_spikes']['median']
+        E_cov = spiking_data['E_spikes']['cov']
+        I_cov = spiking_data['I_spikes']['cov']
+        E_max = spiking_data['E_spikes']['max']
+        I_max = spiking_data['I_spikes']['max']
+        E_min = spiking_data['E_spikes']['min']
+        I_min = spiking_data['I_spikes']['min']
+        EI_spike_ratios = {
+            'mean': E_spikes_mean / I_spikes_mean if E_spikes_mean is not None and I_spikes_mean is not None and I_spikes_mean != 0 else None,
+            'std': E_std / I_std if E_std is not None and I_std is not None and I_std != 0 else None,
+            'median': E_median / I_median if E_median is not None and I_median is not None and I_median != 0 else None,
+            'cov': E_cov / I_cov if E_cov is not None and I_cov is not None and I_cov != 0 else None,
+            'max': E_max / I_max if E_max is not None and I_max is not None and I_max != 0 else None,
+            'min': E_min / I_min if E_min is not None and I_min is not None and I_min != 0 else None,
+        }
+        spiking_data['EI_spike_ratios'] = EI_spike_ratios
         
         # isi
         isis = [i['isi']['mean'] for i in spiking_data['spiking_metrics_by_unit'].values()]
@@ -1369,7 +2213,7 @@ def compute_network_metrics(conv_params, mega_params, source, **kwargs):
             'min': np.nanmin(isis) if len(isis) > 0 else None,
         }
         
-        # E/I isi
+        # E/I/U isi
         i_isis = [metrics['isi']['mean'] for i, metrics in spiking_data['spiking_metrics_by_unit'].items() if i in unit_types and unit_types[i] == 'I'] 
         e_isis = [metrics['isi']['mean'] for i, metrics in spiking_data['spiking_metrics_by_unit'].items() if i in unit_types and unit_types[i] == 'E']
         u_isis = [metrics['isi']['mean'] for i, metrics in spiking_data['spiking_metrics_by_unit'].items() if i not in unit_types]  
@@ -1409,6 +2253,518 @@ def compute_network_metrics(conv_params, mega_params, source, **kwargs):
         # burst metrics
         #bursting_data = network_data['bursting_data']
         #burst_metrics = bursting_data['burst_metrics']
+
+        #baseline metrics
+        bursting_baseline = network_data['bursting_data']['convolved_data']['baseline']
+        mega_baseline = network_data['mega_bursting_data']['convolved_data']['baseline']
+        network_data['bursting_data']['baseline'] = bursting_baseline
+        network_data['mega_bursting_data']['baseline'] = mega_baseline
+
+        #spike in/out burst summary metrics
+        # burst and quiet part rates
+        burst_part_rates=[]
+        quiet_part_rates=[]
+        E_burst_part_rates=[]
+        I_burst_part_rates=[]
+        U_burst_part_rates=[]
+        E_quiet_part_rates=[]
+        I_quiet_part_rates=[]
+        U_quiet_part_rates=[]
+        unit_types = network_data['unit_types']
+        mega_bursting_data = network_data['mega_bursting_data']
+        for unit, metrics in mega_bursting_data['unit_metrics'].items():
+            #print(f'Unit {unit} burst metrics:')
+            burst_part_rate = metrics['burst_part_rate']
+            quiet_part_rate = metrics['quiet_part_rate']
+            burst_part_rates.append(burst_part_rate)
+            quiet_part_rates.append(quiet_part_rate)
+            unit_type = unit_types.get(unit, 'U')  # Default to 'U' if not found
+            if unit_type == 'E':
+                E_burst_part_rates.append(burst_part_rate)
+                E_quiet_part_rates.append(quiet_part_rate)
+            elif unit_type == 'I':
+                I_burst_part_rates.append(burst_part_rate)
+                I_quiet_part_rates.append(quiet_part_rate)
+            elif unit_type == 'U':
+                U_burst_part_rates.append(burst_part_rate)
+                U_quiet_part_rates.append(quiet_part_rate)
+        burst_part_rates = [np.nan if i == np.inf else i for i in burst_part_rates]
+        quiet_part_rates = [np.nan if i == np.inf else i for i in quiet_part_rates]
+        E_burst_part_rates = [np.nan if i == np.inf else i for i in E_burst_part_rates]
+        I_burst_part_rates = [np.nan if i == np.inf else i for i in I_burst_part_rates]
+        U_burst_part_rates = [np.nan if i == np.inf else i for i in U_burst_part_rates]
+        E_quiet_part_rates = [np.nan if i == np.inf else i for i in E_quiet_part_rates]
+        I_quiet_part_rates = [np.nan if i == np.inf else i for i in I_quiet_part_rates]
+        U_quiet_part_rates = [np.nan if i == np.inf else i for i in U_quiet_part_rates]
+        mega_bursting_data['burst_part_rates'] = {
+            'data': burst_part_rates if len(burst_part_rates) > 0 else None,
+            'mean': np.nanmean(burst_part_rates) if len(burst_part_rates) > 0 else None,
+            'std': np.nanstd(burst_part_rates) if len(burst_part_rates) > 0 else None,
+            'median': np.nanmedian(burst_part_rates) if len(burst_part_rates) > 0 else None,
+            'cov': np.nanstd(burst_part_rates) / np.nanmean(burst_part_rates) if np.nanmean(burst_part_rates) and len(burst_part_rates) > 0 else None,
+            'max': np.nanmax(burst_part_rates) if len(burst_part_rates) > 0 else None,
+            'min': np.nanmin(burst_part_rates) if len(burst_part_rates) > 0 else None,
+        }
+        mega_bursting_data['quiet_part_rates'] = {
+            'data': quiet_part_rates if len(quiet_part_rates) > 0 else None,
+            'mean': np.nanmean(quiet_part_rates) if len(quiet_part_rates) > 0 else None,
+            'std': np.nanstd(quiet_part_rates) if len(quiet_part_rates) > 0 else None,
+            'median': np.nanmedian(quiet_part_rates) if len(quiet_part_rates) > 0 else None,
+            'cov': np.nanstd(quiet_part_rates) / np.nanmean(quiet_part_rates) if np.nanmean(quiet_part_rates) and len(quiet_part_rates) > 0 else None,
+            'max': np.nanmax(quiet_part_rates) if len(quiet_part_rates) > 0 else None,
+            'min': np.nanmin(quiet_part_rates) if len(quiet_part_rates) > 0 else None,
+        }
+        mega_bursting_data['E_burst_part_rates'] = {
+            'data': E_burst_part_rates if len(E_burst_part_rates) > 0 else None,
+            'mean': np.nanmean(E_burst_part_rates) if len(E_burst_part_rates) > 0 else None,
+            'std': np.nanstd(E_burst_part_rates) if len(E_burst_part_rates) > 0 else None,
+            'median': np.nanmedian(E_burst_part_rates) if len(E_burst_part_rates) > 0 else None,
+            'cov': np.nanstd(E_burst_part_rates) / np.nanmean(E_burst_part_rates) if np.nanmean(E_burst_part_rates) and len(E_burst_part_rates) > 0 else None,
+            'max': np.nanmax(E_burst_part_rates) if len(E_burst_part_rates) > 0 else None,
+            'min': np.nanmin(E_burst_part_rates) if len(E_burst_part_rates) > 0 else None,
+        }
+        mega_bursting_data['I_burst_part_rates'] = {
+            'data': I_burst_part_rates if len(I_burst_part_rates) > 0 else None,
+            'mean': np.nanmean(I_burst_part_rates) if len(I_burst_part_rates) > 0 else None,
+            'std': np.nanstd(I_burst_part_rates) if len(I_burst_part_rates) > 0 else None,
+            'median': np.nanmedian(I_burst_part_rates) if len(I_burst_part_rates) > 0 else None,
+            'cov': np.nanstd(I_burst_part_rates) / np.nanmean(I_burst_part_rates) if np.nanmean(I_burst_part_rates) and len(I_burst_part_rates) > 0 else None,
+            'max': np.nanmax(I_burst_part_rates) if len(I_burst_part_rates) > 0 else None,
+            'min': np.nanmin(I_burst_part_rates) if len(I_burst_part_rates) > 0 else None,
+        }
+        mega_bursting_data['U_burst_part_rates'] = {
+            'data': U_burst_part_rates if len(U_burst_part_rates) > 0 else None,
+            'mean': np.nanmean(U_burst_part_rates) if len(U_burst_part_rates) > 0 else None,
+            'std': np.nanstd(U_burst_part_rates) if len(U_burst_part_rates) > 0 else None,
+            'median': np.nanmedian(U_burst_part_rates) if len(U_burst_part_rates) > 0 else None,
+            'cov': np.nanstd(U_burst_part_rates) / np.nanmean(U_burst_part_rates) if np.nanmean(U_burst_part_rates) and len(U_burst_part_rates) > 0 else None,
+            'max': np.nanmax(U_burst_part_rates) if len(U_burst_part_rates) > 0 else None,
+            'min': np.nanmin(U_burst_part_rates) if len(U_burst_part_rates) > 0 else None,
+        }
+
+        # in/out burst fr and spikes (unit-wise metrics)
+        all_burst_frs = []
+        all_quiet_frs = []
+        E_burst_frs = []
+        I_burst_frs = []
+        U_burst_frs = []
+        E_quiet_frs = []
+        I_quiet_frs = []
+        U_quiet_frs = []
+        all_in_burst_spikes = []
+        all_out_burst_spikes = []
+        E_in_burst_spikes = []
+        I_in_burst_spikes = []
+        U_in_burst_spikes = []
+        E_out_burst_spikes = []
+        I_out_burst_spikes = []
+        U_out_burst_spikes = []
+        for unit, metrics in mega_bursting_data['unit_metrics'].items():
+            in_burst_fr = metrics['fr']['in_burst'].get('data', None)
+            out_burst_fr = metrics['fr']['out_burst'].get('data', None)
+            in_burst_spikes = metrics['spike_counts']['in_burst'].get('data', None)
+            out_burst_spikes = metrics['spike_counts']['out_burst'].get('data', None)
+            #break
+
+            # Convert dicts to lists if needed
+            def dict_to_list(val):
+                if isinstance(val, dict):
+                    return list(val.values())
+                elif val is None:
+                    return None
+                return val
+
+            in_burst_fr = dict_to_list(in_burst_fr)
+            out_burst_fr = dict_to_list(out_burst_fr)
+            in_burst_spikes = dict_to_list(in_burst_spikes)
+            out_burst_spikes = dict_to_list(out_burst_spikes)
+
+            # burst_frs.extend(in_burst_fr if in_burst_fr is not None else [])
+            # quiet_frs.extend(out_burst_fr if out_burst_fr is not None else [])
+            # in_burst_spikes.extend(in_burst_spikes if in_burst_spikes is not None else [])
+            # out_burst_spikes.extend(out_burst_spikes if out_burst_spikes is not None else [])
+            if in_burst_fr is not None: all_burst_frs.extend(in_burst_fr)
+            if out_burst_fr is not None: all_quiet_frs.extend(out_burst_fr)
+            if in_burst_spikes is not None: all_in_burst_spikes.extend(in_burst_spikes)
+            if out_burst_spikes is not None: all_out_burst_spikes.extend(out_burst_spikes)
+            unit_type = unit_types.get(unit, 'U')  # Default to 'U' if not found
+            if unit_type == 'E':
+                E_burst_frs.extend(in_burst_fr if in_burst_fr is not None else [])
+                E_quiet_frs.extend(out_burst_fr if out_burst_fr is not None else [])
+                E_in_burst_spikes.extend(in_burst_spikes if in_burst_spikes is not None else [])
+                E_out_burst_spikes.extend(out_burst_spikes if out_burst_spikes is not None else [])
+            elif unit_type == 'I':
+                I_burst_frs.extend(in_burst_fr if in_burst_fr is not None else [])
+                I_quiet_frs.extend(out_burst_fr if out_burst_fr is not None else [])
+                I_in_burst_spikes.extend(in_burst_spikes if in_burst_spikes is not None else [])
+                I_out_burst_spikes.extend(out_burst_spikes if out_burst_spikes is not None else [])
+            elif unit_type == 'U':
+                U_burst_frs.extend(in_burst_fr if in_burst_fr is not None else [])
+                U_quiet_frs.extend(out_burst_fr if out_burst_fr is not None else [])
+                U_in_burst_spikes.extend(in_burst_spikes if in_burst_spikes is not None else [])
+                U_out_burst_spikes.extend(out_burst_spikes if out_burst_spikes is not None else [])  
+        all_burst_frs = [np.nan if i == np.inf else i for i in all_burst_frs]
+        all_quiet_frs = [np.nan if i == np.inf else i for i in all_quiet_frs]
+        E_burst_frs = [np.nan if i == np.inf else i for i in E_burst_frs]
+        I_burst_frs = [np.nan if i == np.inf else i for i in I_burst_frs]
+        U_burst_frs = [np.nan if i == np.inf else i for i in U_burst_frs]
+        E_quiet_frs = [np.nan if i == np.inf else i for i in E_quiet_frs]
+        I_quiet_frs = [np.nan if i == np.inf else i for i in I_quiet_frs]
+        U_quiet_frs = [np.nan if i == np.inf else i for i in U_quiet_frs]
+        if all_burst_frs is None: all_burst_frs = []
+        mega_bursting_data['burst_frs'] = {
+            'data': all_burst_frs if len(all_burst_frs) > 0 else None,
+            'mean': np.nanmean(all_burst_frs) if len(all_burst_frs) > 0 else None,
+            'std': np.nanstd(all_burst_frs) if len(all_burst_frs) > 0 else None,
+            'median': np.nanmedian(all_burst_frs) if len(all_burst_frs) > 0 else None,
+            'cov': np.nanstd(all_burst_frs) / np.nanmean(all_burst_frs) if np.nanmean(all_burst_frs) and len(all_burst_frs) > 0 else None,
+            'max': np.nanmax(all_burst_frs) if len(all_burst_frs) > 0 else None,
+            'min': np.nanmin(all_burst_frs) if len(all_burst_frs) > 0 else None,
+        }
+        if all_quiet_frs is None: all_quiet_frs = []
+        mega_bursting_data['quiet_frs'] = {
+            'data': all_quiet_frs if len(all_quiet_frs) > 0 else None,
+            'mean': np.nanmean(all_quiet_frs) if len(all_quiet_frs) > 0 else None,
+            'std': np.nanstd(all_quiet_frs) if len(all_quiet_frs) > 0 else None,
+            'median': np.nanmedian(all_quiet_frs) if len(all_quiet_frs) > 0 else None,
+            'cov': np.nanstd(all_quiet_frs) / np.nanmean(all_quiet_frs) if np.nanmean(all_quiet_frs) and len(all_quiet_frs) > 0 else None,
+            'max': np.nanmax(all_quiet_frs) if len(all_quiet_frs) > 0 else None,
+            'min': np.nanmin(all_quiet_frs) if len(all_quiet_frs) > 0 else None,
+        }
+        if E_burst_frs is None: E_burst_frs = []
+        mega_bursting_data['E_burst_frs'] = {
+            'data': E_burst_frs if len(E_burst_frs) > 0 else None,
+            'mean': np.nanmean(E_burst_frs) if len(E_burst_frs) > 0 else None,
+            'std': np.nanstd(E_burst_frs) if len(E_burst_frs) > 0 else None,
+            'median': np.nanmedian(E_burst_frs) if len(E_burst_frs) > 0 else None,
+            'cov': np.nanstd(E_burst_frs) / np.nanmean(E_burst_frs) if np.nanmean(E_burst_frs) and len(E_burst_frs) > 0 else None,
+            'max': np.nanmax(E_burst_frs) if len(E_burst_frs) > 0 else None,
+            'min': np.nanmin(E_burst_frs) if len(E_burst_frs) > 0 else None,
+        }
+        if I_burst_frs is None: I_burst_frs = []
+        mega_bursting_data['I_burst_frs'] = {
+            'data': I_burst_frs if len(I_burst_frs) > 0 else None,
+            'mean': np.nanmean(I_burst_frs) if len(I_burst_frs) > 0 else None,
+            'std': np.nanstd(I_burst_frs) if len(I_burst_frs) > 0 else None,
+            'median': np.nanmedian(I_burst_frs) if len(I_burst_frs) > 0 else None,
+            'cov': np.nanstd(I_burst_frs) / np.nanmean(I_burst_frs) if np.nanmean(I_burst_frs) and len(I_burst_frs) > 0 else None,
+            'max': np.nanmax(I_burst_frs) if len(I_burst_frs) > 0 else None,
+            'min': np.nanmin(I_burst_frs) if len(I_burst_frs) > 0 else None,
+        }
+        if U_burst_frs is None: U_burst_frs = []
+        mega_bursting_data['U_burst_frs'] = {
+            'data': U_burst_frs if len(U_burst_frs) > 0 else None,
+            'mean': np.nanmean(U_burst_frs) if len(U_burst_frs) > 0 else None,
+            'std': np.nanstd(U_burst_frs) if len(U_burst_frs) > 0 else None,
+            'median': np.nanmedian(U_burst_frs) if len(U_burst_frs) > 0 else None,
+            'cov': np.nanstd(U_burst_frs) / np.nanmean(U_burst_frs) if np.nanmean(U_burst_frs) and len(U_burst_frs) > 0 else None,
+            'max': np.nanmax(U_burst_frs) if len(U_burst_frs) > 0 else None,
+            'min': np.nanmin(U_burst_frs) if len(U_burst_frs) > 0 else None,
+        }
+        if E_quiet_frs is None: E_quiet_frs = []
+        mega_bursting_data['E_quiet_frs'] = {
+            'data': E_quiet_frs if len(E_quiet_frs) > 0 else None,
+            'mean': np.nanmean(E_quiet_frs) if len(E_quiet_frs) > 0 else None,
+            'std': np.nanstd(E_quiet_frs) if len(E_quiet_frs) > 0 else None,
+            'median': np.nanmedian(E_quiet_frs) if len(E_quiet_frs) > 0 else None,  
+            'cov': np.nanstd(E_quiet_frs) / np.nanmean(E_quiet_frs) if np.nanmean(E_quiet_frs) and len(E_quiet_frs) > 0 else None,
+            'max': np.nanmax(E_quiet_frs) if len(E_quiet_frs) > 0 else None,
+            'min': np.nanmin(E_quiet_frs) if len(E_quiet_frs) > 0 else None,
+        }
+        if I_quiet_frs is None: I_quiet_frs = []
+        mega_bursting_data['I_quiet_frs'] = {
+            'data': I_quiet_frs if len(I_quiet_frs) > 0 else None,
+            'mean': np.nanmean(I_quiet_frs) if len(I_quiet_frs) > 0 else None,
+            'std': np.nanstd(I_quiet_frs) if len(I_quiet_frs) > 0 else None,
+            'median': np.nanmedian(I_quiet_frs) if len(I_quiet_frs) > 0 else None,
+            'cov': np.nanstd(I_quiet_frs) / np.nanmean(I_quiet_frs) if np.nanmean(I_quiet_frs) and len(I_quiet_frs) > 0 else None,
+            'max': np.nanmax(I_quiet_frs) if len(I_quiet_frs) > 0 else None,
+            'min': np.nanmin(I_quiet_frs) if len(I_quiet_frs) > 0 else None,
+        }
+        if U_quiet_frs is None: U_quiet_frs = []
+        mega_bursting_data['U_quiet_frs'] = {
+            'data': U_quiet_frs if len(U_quiet_frs) > 0 else None,
+            'mean': np.nanmean(U_quiet_frs) if len(U_quiet_frs) > 0 else None,
+            'std': np.nanstd(U_quiet_frs) if len(U_quiet_frs) > 0 else None,
+            'median': np.nanmedian(U_quiet_frs) if len(U_quiet_frs) > 0 else None,
+            'cov': np.nanstd(U_quiet_frs) / np.nanmean(U_quiet_frs) if np.nanmean(U_quiet_frs) and len(U_quiet_frs) > 0 else None,
+            'max': np.nanmax(U_quiet_frs) if len(U_quiet_frs) > 0 else None,
+            'min': np.nanmin(U_quiet_frs) if len(U_quiet_frs) > 0 else None,
+        }
+        if all_in_burst_spikes is None: all_in_burst_spikes = []
+        mega_bursting_data['in_burst_spikes'] = {
+            'data': all_in_burst_spikes if len(all_in_burst_spikes) > 0 else None,
+            'mean': np.nanmean(all_in_burst_spikes) if len(all_in_burst_spikes) > 0 else None,
+            'std': np.nanstd(all_in_burst_spikes) if len(all_in_burst_spikes) > 0 else None,
+            'median': np.nanmedian(all_in_burst_spikes) if len(all_in_burst_spikes) > 0 else None,
+            'cov': np.nanstd(all_in_burst_spikes) / np.nanmean(all_in_burst_spikes) if np.nanmean(all_in_burst_spikes) and len(all_in_burst_spikes) > 0 else None,
+            'max': np.nanmax(all_in_burst_spikes) if len(all_in_burst_spikes) > 0 else None,
+            'min': np.nanmin(all_in_burst_spikes) if len(all_in_burst_spikes) > 0 else None,
+        }
+        if all_out_burst_spikes is None: all_out_burst_spikes = []
+        mega_bursting_data['out_burst_spikes'] = {
+            'data': all_out_burst_spikes if len(all_out_burst_spikes) > 0 else None,
+            'mean': np.nanmean(all_out_burst_spikes) if len(all_out_burst_spikes) > 0 else None,
+            'std': np.nanstd(all_out_burst_spikes) if len(all_out_burst_spikes) > 0 else None,
+            'median': np.nanmedian(all_out_burst_spikes) if len(all_out_burst_spikes) > 0 else None,
+            'cov': np.nanstd(all_out_burst_spikes) / np.nanmean(all_out_burst_spikes) if np.nanmean(all_out_burst_spikes) and len(all_out_burst_spikes) > 0 else None,
+            'max': np.nanmax(all_out_burst_spikes) if len(all_out_burst_spikes) > 0 else None,
+            'min': np.nanmin(all_out_burst_spikes) if len(all_out_burst_spikes) > 0 else None,
+        }
+        if E_in_burst_spikes is None: E_in_burst_spikes = []
+        mega_bursting_data['E_in_burst_spikes'] = {
+            'data': E_in_burst_spikes if len(E_in_burst_spikes) > 0 else None,
+            'mean': np.nanmean(E_in_burst_spikes) if len(E_in_burst_spikes) > 0 else None,
+            'std': np.nanstd(E_in_burst_spikes) if len(E_in_burst_spikes) > 0 else None,
+            'median': np.nanmedian(E_in_burst_spikes) if len(E_in_burst_spikes) > 0 else None,
+            'cov': np.nanstd(E_in_burst_spikes) / np.nanmean(E_in_burst_spikes) if np.nanmean(E_in_burst_spikes) and len(E_in_burst_spikes) > 0 else None,
+            'max': np.nanmax(E_in_burst_spikes) if len(E_in_burst_spikes) > 0 else None,
+            'min': np.nanmin(E_in_burst_spikes) if len(E_in_burst_spikes) > 0 else None,
+        }
+        if I_in_burst_spikes is None: I_in_burst_spikes = []
+        mega_bursting_data['I_in_burst_spikes'] = {
+            'data': I_in_burst_spikes if len(I_in_burst_spikes) > 0 else None,
+            'mean': np.nanmean(I_in_burst_spikes) if len(I_in_burst_spikes) > 0 else None,
+            'std': np.nanstd(I_in_burst_spikes) if len(I_in_burst_spikes) > 0 else None,
+            'median': np.nanmedian(I_in_burst_spikes) if len(I_in_burst_spikes) > 0 else None,
+            'cov': np.nanstd(I_in_burst_spikes) / np.nanmean(I_in_burst_spikes) if np.nanmean(I_in_burst_spikes) and len(I_in_burst_spikes) > 0 else None,
+            'max': np.nanmax(I_in_burst_spikes) if len(I_in_burst_spikes) > 0 else None,
+            'min': np.nanmin(I_in_burst_spikes) if len(I_in_burst_spikes) > 0 else None,
+        }
+        if U_in_burst_spikes is None: U_in_burst_spikes = []
+        mega_bursting_data['U_in_burst_spikes'] = {
+            'data': U_in_burst_spikes if len(U_in_burst_spikes) > 0 else None,
+            'mean': np.nanmean(U_in_burst_spikes) if len(U_in_burst_spikes) > 0 else None,
+            'std': np.nanstd(U_in_burst_spikes) if len(U_in_burst_spikes) > 0 else None,
+            'median': np.nanmedian(U_in_burst_spikes) if len(U_in_burst_spikes) > 0 else None,
+            'cov': np.nanstd(U_in_burst_spikes) / np.nanmean(U_in_burst_spikes) if np.nanmean(U_in_burst_spikes) and len(U_in_burst_spikes) > 0 else None,
+            'max': np.nanmax(U_in_burst_spikes) if len(U_in_burst_spikes) > 0 else None,
+            'min': np.nanmin(U_in_burst_spikes) if len(U_in_burst_spikes) > 0 else None,
+        }
+        if E_out_burst_spikes is None: E_out_burst_spikes = []
+        mega_bursting_data['E_out_burst_spikes'] = {
+            'data': E_out_burst_spikes if len(E_out_burst_spikes) > 0 else None,
+            'mean': np.nanmean(E_out_burst_spikes) if len(E_out_burst_spikes) > 0 else None,
+            'std': np.nanstd(E_out_burst_spikes) if len(E_out_burst_spikes) > 0 else None,
+            'median': np.nanmedian(E_out_burst_spikes) if len(E_out_burst_spikes) > 0 else None,
+            'cov': np.nanstd(E_out_burst_spikes) / np.nanmean(E_out_burst_spikes) if np.nanmean(E_out_burst_spikes) and len(E_out_burst_spikes) > 0 else None,
+            'max': np.nanmax(E_out_burst_spikes) if len(E_out_burst_spikes) > 0 else None,
+            'min': np.nanmin(E_out_burst_spikes) if len(E_out_burst_spikes) > 0 else None,
+        }
+        if I_out_burst_spikes is None: I_out_burst_spikes = []
+        mega_bursting_data['I_out_burst_spikes'] = {
+            'data': I_out_burst_spikes if len(I_out_burst_spikes) > 0 else None,
+            'mean': np.nanmean(I_out_burst_spikes) if len(I_out_burst_spikes) > 0 else None,
+            'std': np.nanstd(I_out_burst_spikes) if len(I_out_burst_spikes) > 0 else None,
+            'median': np.nanmedian(I_out_burst_spikes) if len(I_out_burst_spikes) > 0 else None,
+            'cov': np.nanstd(I_out_burst_spikes) / np.nanmean(I_out_burst_spikes) if np.nanmean(I_out_burst_spikes) and len(I_out_burst_spikes) > 0 else None,
+            'max': np.nanmax(I_out_burst_spikes) if len(I_out_burst_spikes) > 0 else None,
+            'min': np.nanmin(I_out_burst_spikes) if len(I_out_burst_spikes) > 0 else None,
+        }
+        if U_out_burst_spikes is None: U_out_burst_spikes = []
+        mega_bursting_data['U_out_burst_spikes'] = {
+            'data': U_out_burst_spikes if len(U_out_burst_spikes) > 0 else None,
+            'mean': np.nanmean(U_out_burst_spikes) if len(U_out_burst_spikes) > 0 else None,
+            'std': np.nanstd(U_out_burst_spikes) if len(U_out_burst_spikes) > 0 else None,
+            'median': np.nanmedian(U_out_burst_spikes) if len(U_out_burst_spikes) > 0 else None,
+            'cov': np.nanstd(U_out_burst_spikes) / np.nanmean(U_out_burst_spikes) if np.nanmean(U_out_burst_spikes) and len(U_out_burst_spikes) > 0 else None,
+            'max': np.nanmax(U_out_burst_spikes) if len(U_out_burst_spikes) > 0 else None,
+            'min': np.nanmin(U_out_burst_spikes) if len(U_out_burst_spikes) > 0 else None,
+        }
+        
+        # in/out burst spikes per burst (burst-wise metrics)
+        try:
+            burst_spike_counts={}
+            burst_spike_counts_E = {}
+            burst_spike_counts_I = {}
+            burst_spike_counts_U = {}
+            quiet_spike_counts = {}
+            quiet_spike_counts_E = {}
+            quiet_spike_counts_I = {}
+            quiet_spike_counts_U = {}
+            # all_in_burst_spikes_per_burst = []
+            # all_out_burst_spikes_per_burst = []
+            # E_in_burst_spikes_per_burst = []
+            # I_in_burst_spikes_per_burst = []
+            # U_in_burst_spikes_per_burst = []
+            # E_out_burst_spikes_per_burst = []
+            # I_out_burst_spikes_per_burst = []
+            # U_out_burst_spikes_per_burst = []
+            for unit, metrics in mega_bursting_data['unit_metrics'].items():
+                print(f'Processing unit {unit}...')
+                burst_ids = metrics['burst_id']
+                quiet_ids = metrics['quiet_id']
+                unit_type = unit_types.get(unit, 'U')  # Default to 'U' if not found
+                for burst_id in burst_ids:
+                    in_burst_spikes = metrics['spike_counts']['in_burst'].get('data', {}).get(burst_id, None)
+                    if burst_id not in burst_spike_counts:
+                        burst_spike_counts[burst_id] = in_burst_spikes if in_burst_spikes is not None else 0
+                        # if unit_type == 'E':
+                        #     burst_spike_counts_E[burst_id] = in_burst_spikes if in_burst_spikes is not None else 0
+                        # elif unit_type == 'I':
+                        #     burst_spike_counts_I[burst_id] = in_burst_spikes if in_burst_spikes is not None else 0
+                        # elif unit_type == 'U':
+                        #     burst_spike_counts_U[burst_id] = in_burst_spikes if in_burst_spikes is not None else 0
+                    else:
+                        burst_spike_counts[burst_id] += in_burst_spikes if in_burst_spikes is not None else 0
+                        # if unit_type == 'E':
+                        #     burst_spike_counts_E[burst_id] += in_burst_spikes if in_burst_spikes is not None else 0
+                        # elif unit_type == 'I':
+                        #     burst_spike_counts_I[burst_id] += in_burst_spikes if in_burst_spikes is not None else 0
+                        # elif unit_type == 'U':
+                        #     burst_spike_counts_U[burst_id] += in_burst_spikes if in_burst_spikes is not None else 0
+                    if unit_type == 'E':
+                        if burst_id not in burst_spike_counts_E:
+                            burst_spike_counts_E[burst_id] = in_burst_spikes if in_burst_spikes is not None else 0
+                        else:
+                            burst_spike_counts_E[burst_id] += in_burst_spikes if in_burst_spikes is not None else 0
+                    elif unit_type == 'I':
+                        if burst_id not in burst_spike_counts_I:
+                            burst_spike_counts_I[burst_id] = in_burst_spikes if in_burst_spikes is not None else 0
+                        else:
+                            burst_spike_counts_I[burst_id] += in_burst_spikes if in_burst_spikes is not None else 0
+                    elif unit_type == 'U':
+                        if burst_id not in burst_spike_counts_U:
+                            burst_spike_counts_U[burst_id] = in_burst_spikes if in_burst_spikes is not None else 0
+                        else:
+                            burst_spike_counts_U[burst_id] += in_burst_spikes if in_burst_spikes is not None else 0
+
+                for quiet_id in quiet_ids:
+                    out_burst_spikes = metrics['spike_counts']['out_burst'].get('data', {}).get(quiet_id, None)
+                    if quiet_id not in quiet_spike_counts:
+                        quiet_spike_counts[quiet_id] = out_burst_spikes if out_burst_spikes is not None else 0
+                    else:
+                        quiet_spike_counts[quiet_id] += out_burst_spikes if out_burst_spikes is not None else 0
+                        #burst_spike_counts[quiet_id] += out_burst_spikes if out_burst_spikes is not None else 0
+                        # if unit_type == 'E':
+                        #     burst_spike_counts_E[quiet_id] += out_burst_spikes if out_burst_spikes is not None else 0
+                        # elif unit_type == 'I':
+                        #     burst_spike_counts_I[quiet_id] += out_burst_spikes if out_burst_spikes is not None else 0
+                        # elif unit_type == 'U':
+                        #     burst_spike_counts_U[quiet_id] += out_burst_spikes if out_burst_spikes is not None else 0
+                    if unit_type == 'E':
+                        if quiet_id not in quiet_spike_counts_E:
+                            #burst_spike_counts_E[quiet_id] = out_burst_spikes if out_burst_spikes is not None else 0
+                            quiet_spike_counts_E[quiet_id] = out_burst_spikes if out_burst_spikes is not None else 0
+                        else:
+                            #burst_spike_counts_E[quiet_id] += out_burst_spikes if out_burst_spikes is not None else 0
+                            quiet_spike_counts_E[quiet_id] += out_burst_spikes if out_burst_spikes is not None else 0
+                    elif unit_type == 'I':
+                        if quiet_id not in quiet_spike_counts_I:
+                            #burst_spike_counts_I[quiet_id] = out_burst_spikes if out_burst_spikes is not None else 0
+                            quiet_spike_counts_I[quiet_id] = out_burst_spikes if out_burst_spikes is not None else 0
+                        else:
+                            #burst_spike_counts_I[quiet_id] += out_burst_spikes if out_burst_spikes is not None else 0
+                            quiet_spike_counts_I[quiet_id] += out_burst_spikes if out_burst_spikes is not None else 0
+                    elif unit_type == 'U':
+                        if quiet_id not in quiet_spike_counts_U:
+                            #burst_spike_counts_U[quiet_id] = out_burst_spikes if out_burst_spikes is not None else 0
+                            quiet_spike_counts_U[quiet_id] = out_burst_spikes if out_burst_spikes is not None else 0
+                        else:
+                            #burst_spike_counts_U[quiet_id] += out_burst_spikes if out_burst_spikes is not None else 0
+                            quiet_spike_counts_U[quiet_id] += out_burst_spikes if out_burst_spikes is not None else 0
+            # convert burst_spike_counts to lists
+            burst_spike_counts_list = list(burst_spike_counts.values())
+            burst_spike_counts_E_list = list(burst_spike_counts_E.values())
+            burst_spike_counts_I_list = list(burst_spike_counts_I.values())
+            burst_spike_counts_U_list = list(burst_spike_counts_U.values())
+            quiet_spike_counts_list = list(quiet_spike_counts.values())
+            quiet_spike_counts_E_list = list(quiet_spike_counts_E.values())
+            quiet_spike_counts_I_list = list(quiet_spike_counts_I.values())
+            quiet_spike_counts_U_list = list(quiet_spike_counts_U.values())
+            if burst_spike_counts_list is None: burst_spike_counts_list = []
+            mega_bursting_data['burst_spike_counts'] = {
+                'data': burst_spike_counts_list if len(burst_spike_counts_list) > 0 else None,
+                'mean': np.nanmean(burst_spike_counts_list) if len(burst_spike_counts_list) > 0 else None,
+                'std': np.nanstd(burst_spike_counts_list) if len(burst_spike_counts_list) > 0 else None,
+                'median': np.nanmedian(burst_spike_counts_list) if len(burst_spike_counts_list) > 0 else None,
+                'cov': np.nanstd(burst_spike_counts_list) / np.nanmean(burst_spike_counts_list) if np.nanmean(burst_spike_counts_list) and len(burst_spike_counts_list) > 0 else None,
+                'max': np.nanmax(burst_spike_counts_list) if len(burst_spike_counts_list) > 0 else None,
+                'min': np.nanmin(burst_spike_counts_list) if len(burst_spike_counts_list) > 0 else None,
+            }
+            if burst_spike_counts_E_list is None: burst_spike_counts_E_list = []
+            mega_bursting_data['burst_spike_counts_E'] = {
+                'data': burst_spike_counts_E_list if len(burst_spike_counts_E_list) > 0 else None,
+                'mean': np.nanmean(burst_spike_counts_E_list) if len(burst_spike_counts_E_list) > 0 else None,
+                'std': np.nanstd(burst_spike_counts_E_list) if len(burst_spike_counts_E_list) > 0 else None,
+                'median': np.nanmedian(burst_spike_counts_E_list) if len(burst_spike_counts_E_list) > 0 else None,
+                'cov': np.nanstd(burst_spike_counts_E_list) / np.nanmean(burst_spike_counts_E_list) if np.nanmean(burst_spike_counts_E_list) and len(burst_spike_counts_E_list) > 0 else None,
+                'max': np.nanmax(burst_spike_counts_E_list) if len(burst_spike_counts_E_list) > 0 else None,
+                'min': np.nanmin(burst_spike_counts_E_list) if len(burst_spike_counts_E_list) > 0 else None,
+            }
+            if burst_spike_counts_I_list is None: burst_spike_counts_I_list = []
+            mega_bursting_data['burst_spike_counts_I'] = {
+                'data': burst_spike_counts_I_list if len(burst_spike_counts_I_list) > 0 else None,
+                'mean': np.nanmean(burst_spike_counts_I_list) if len(burst_spike_counts_I_list) > 0 else None,
+                'std': np.nanstd(burst_spike_counts_I_list) if len(burst_spike_counts_I_list) > 0 else None,
+                'median': np.nanmedian(burst_spike_counts_I_list) if len(burst_spike_counts_I_list) > 0 else None,
+                'cov': np.nanstd(burst_spike_counts_I_list) / np.nanmean(burst_spike_counts_I_list) if np.nanmean(burst_spike_counts_I_list) and len(burst_spike_counts_I_list) > 0 else None,
+                'max': np.nanmax(burst_spike_counts_I_list) if len(burst_spike_counts_I_list) > 0 else None,
+                'min': np.nanmin(burst_spike_counts_I_list) if len(burst_spike_counts_I_list) > 0 else None,
+            }
+            if burst_spike_counts_U_list is None: burst_spike_counts_U_list = []
+            mega_bursting_data['burst_spike_counts_U'] = {
+                'data': burst_spike_counts_U_list if len(burst_spike_counts_U_list) > 0 else None,
+                'mean': np.nanmean(burst_spike_counts_U_list) if len(burst_spike_counts_U_list) > 0 else None,
+                'std': np.nanstd(burst_spike_counts_U_list) if len(burst_spike_counts_U_list) > 0 else None,
+                'median': np.nanmedian(burst_spike_counts_U_list) if len(burst_spike_counts_U_list) > 0 else None,
+                'cov': np.nanstd(burst_spike_counts_U_list) / np.nanmean(burst_spike_counts_U_list) if np.nanmean(burst_spike_counts_U_list) and len(burst_spike_counts_U_list) > 0 else None,
+                'max': np.nanmax(burst_spike_counts_U_list) if len(burst_spike_counts_U_list) > 0 else None,
+                'min': np.nanmin(burst_spike_counts_U_list) if len(burst_spike_counts_U_list) > 0 else None,
+            }
+            if quiet_spike_counts_list is None: quiet_spike_counts_list = []
+            mega_bursting_data['quiet_spike_counts'] = {
+                'data': quiet_spike_counts_list if len(quiet_spike_counts_list) > 0 else None,
+                'mean': np.nanmean(quiet_spike_counts_list) if len(quiet_spike_counts_list) > 0 else None,
+                'std': np.nanstd(quiet_spike_counts_list) if len(quiet_spike_counts_list) > 0 else None,
+                'median': np.nanmedian(quiet_spike_counts_list) if len(quiet_spike_counts_list) > 0 else None,
+                'cov': np.nanstd(quiet_spike_counts_list) / np.nanmean(quiet_spike_counts_list) if np.nanmean(quiet_spike_counts_list) and len(quiet_spike_counts_list) > 0 else None,
+                'max': np.nanmax(quiet_spike_counts_list) if len(quiet_spike_counts_list) > 0 else None,
+                'min': np.nanmin(quiet_spike_counts_list) if len(quiet_spike_counts_list) > 0 else None,
+            }
+            if quiet_spike_counts_E_list is None: quiet_spike_counts_E_list = []
+            mega_bursting_data['quiet_spike_counts_E'] = {
+                'data': quiet_spike_counts_E_list if len(quiet_spike_counts_E_list) > 0 else None,
+                'mean': np.nanmean(quiet_spike_counts_E_list) if len(quiet_spike_counts_E_list) > 0 else None,
+                'std': np.nanstd(quiet_spike_counts_E_list) if len(quiet_spike_counts_E_list) > 0 else None,
+                'median': np.nanmedian(quiet_spike_counts_E_list) if len(quiet_spike_counts_E_list) > 0 else None,
+                'cov': np.nanstd(quiet_spike_counts_E_list) / np.nanmean(quiet_spike_counts_E_list) if np.nanmean(quiet_spike_counts_E_list) and len(quiet_spike_counts_E_list) > 0 else None,
+                'max': np.nanmax(quiet_spike_counts_E_list) if len(quiet_spike_counts_E_list) > 0 else None,
+                'min': np.nanmin(quiet_spike_counts_E_list) if len(quiet_spike_counts_E_list) > 0 else None,
+            }
+            if quiet_spike_counts_I_list is None: quiet_spike_counts_I_list = []
+            mega_bursting_data['quiet_spike_counts_I'] = {
+                'data': quiet_spike_counts_I_list if len(quiet_spike_counts_I_list) > 0 else None,
+                'mean': np.nanmean(quiet_spike_counts_I_list) if len(quiet_spike_counts_I_list) > 0 else None,
+                'std': np.nanstd(quiet_spike_counts_I_list) if len(quiet_spike_counts_I_list) > 0 else None,
+                'median': np.nanmedian(quiet_spike_counts_I_list) if len(quiet_spike_counts_I_list) > 0 else None,
+                'cov': np.nanstd(quiet_spike_counts_I_list) / np.nanmean(quiet_spike_counts_I_list) if np.nanmean(quiet_spike_counts_I_list) and len(quiet_spike_counts_I_list) > 0 else None,
+                'max': np.nanmax(quiet_spike_counts_I_list) if len(quiet_spike_counts_I_list) > 0 else None,
+                'min': np.nanmin(quiet_spike_counts_I_list) if len(quiet_spike_counts_I_list) > 0 else None,
+            }
+            if quiet_spike_counts_U_list is None: quiet_spike_counts_U_list = []
+            mega_bursting_data['quiet_spike_counts_U'] = {
+                'data': quiet_spike_counts_U_list if len(quiet_spike_counts_U_list) > 0 else None,
+                'mean': np.nanmean(quiet_spike_counts_U_list) if len(quiet_spike_counts_U_list) > 0 else None,
+                'std': np.nanstd(quiet_spike_counts_U_list) if len(quiet_spike_counts_U_list) > 0 else None,
+                'median': np.nanmedian(quiet_spike_counts_U_list) if len(quiet_spike_counts_U_list) > 0 else None,
+                'cov': np.nanstd(quiet_spike_counts_U_list) / np.nanmean(quiet_spike_counts_U_list) if np.nanmean(quiet_spike_counts_U_list) and len(quiet_spike_counts_U_list) > 0 else None,
+                'max': np.nanmax(quiet_spike_counts_U_list) if len(quiet_spike_counts_U_list) > 0 else None,
+                'min': np.nanmin(quiet_spike_counts_U_list) if len(quiet_spike_counts_U_list) > 0 else None,
+            }
+            
+
+        except Exception as e:
+            traceback.print_exc()
+            print(f'Error processing unit {unit}: {e}')
+        
+        
+        
+        # add to network_data
+        network_data['mega_bursting_data'] = mega_bursting_data
+
+
+        #TODO: add in to out of burst fr ratio metrics
         
         
         #raise NotImplementedError('This function is not yet implemented.')
@@ -1435,6 +2791,8 @@ def compute_network_metrics(conv_params, mega_params, source, **kwargs):
         elif source == 'experimental':
             #we = kwargs.get('wf_extractor', None)
             sa = kwargs.get('sorting_analyzer', None)
+            recording_object = kwargs.get('recording_object', None)
+            rec_path = recording_object.neo_reader.filename
             #wfs = sa.get_extension("waveforms")
             
             classification_output = network_data['classification_output']
@@ -1442,6 +2800,11 @@ def compute_network_metrics(conv_params, mega_params, source, **kwargs):
             # classified_units = classification_output['classified_units']
 
             print(f'Getting unit locations for {len(include_unit_ids)} units...')            
+            #sa.load('recording')
+            # print recording path sa is looking for
+            #prop = sa.get_recording_property('recording_path')
+            #sa.set_temporary_recording(recording_object)
+
             if "templates" not in sa.extensions:
                 sa.compute("templates")
             unit_locations = spost.compute_unit_locations(sa)
@@ -1472,8 +2835,10 @@ def compute_network_metrics(conv_params, mega_params, source, **kwargs):
         _, _, _, network_data = initialize_spike_data(network_data, kwargs)
         
         # main computation steps
+        #network_data = compute_baseline(network_data, kwargs)
         network_data = compute_spike_metrics(network_data, kwargs)
         network_data = compute_burst_metrics(network_data, kwargs)
+        #network_data = compute_HFBursting_metrics(network_data, kwargs)
         network_data = classify_units(network_data, kwargs)
         network_data = locate_units(network_data, kwargs)
         if source == 'experimental': # for now only do with with experimental data
@@ -1854,7 +3219,7 @@ def extract_metrics_from_experimental_data_v3(spike_times, timeVector, spike_tim
     # Store computed spiking metrics
     network_data['spiking_data']['spiking_metrics_by_unit'] = spiking_metrics_by_unit
 
-def compute_wf_metrics(best_channel_waveforms, sampling_rate, plot_wf=False, save_fig=False, fig_name="waveform_debug.png", unit=None):
+def compute_wf_metrics_dep(best_channel_waveforms, sampling_rate, plot_wf=False, save_fig=False, fig_name="waveform_debug.png", unit=None):
     '''Get key waveform metrics from a single unit using a weighted average approach.'''
     
     unit_wfs = best_channel_waveforms
@@ -3985,10 +5350,67 @@ def analyze_unit_activity(spike_times_by_unit, convolved_data):
     left_base_times, right_base_times = convolved_data['left_base_times'], convolved_data['right_base_times']
     time_range = convolved_data['time_vector'][-1] - convolved_data['time_vector'][0]
 
+    # 2025-05-30 16:00:18 due to overlapping bursts, need to consider all left and right base times to get left and right quiet periods
+    # merged = []
+    # intervals = np.column_stack((left_base_times, right_base_times))
+
+    # # remove idx 2 in intervals
+    # intervals = np.delete(intervals, 2, axis=0) # 2025-06-02 01:48:02 for debugging purposes, remove idx 2 in intervals
+
+    # earliest_start = None
+    # lastest_end = None
+    # for start, end in intervals:
+    #     if lastest_end is not None:
+    #         if start > lastest_end:
+    #             print('found quiet period')
+    #             print(f'Quiet period from {lastest_end} to {start}')
+    #     if earliest_start is None or start < earliest_start:
+    #         earliest_start = start
+    #     if lastest_end is None or end > lastest_end:
+    #         lastest_end = end
+
+    # 2025-05-30 16:00:25 the above method might work for hyper bursting... unsure... but it appears bursting periods start and end right ontop of eachother in regular bursting so there arent any quiet periods...which is not right.
+    # insteady I'm just got to find periods where we're below baseline + 10% in the meantime.
+    baseline = convolved_data.get('baseline', None)
+    if baseline is None:
+        print("[Warning] No baseline found in convolved_data. Using 0 as baseline.")
+        baseline = 0.0  # Default to 0 if no baseline is provided
+    threshold = baseline * 1.1  # 10% above baseline
+    convolved_FR = convolved_data.get('convolved_FR', None)
+    time_vector = convolved_data.get('time_vector', None)
+
+    #get times where threshold is crossed
+    if convolved_FR is None or time_vector is None:
+        raise ValueError("convolved_FR and time_vector must be provided in convolved_data for burst analysis.")
+    
+    #quiet_times = time_vector[np.where(convolved_FR <= threshold)[0]]
+    quiet_time_idx = np.where(convolved_FR <= threshold)[0]
+
+    # get continuous quiet periods
+    quiet_idx_intervals = []
+    if len(quiet_time_idx) > 0:
+        # Find continuous quiet periods
+        start_idx = quiet_time_idx[0]
+        for i in range(1, len(quiet_time_idx)):
+            if quiet_time_idx[i] != quiet_time_idx[i - 1] + 1:  # Check for discontinuity
+                quiet_idx_intervals.append((start_idx, quiet_time_idx[i - 1]))
+                start_idx = quiet_time_idx[i]
+        # Add the last period
+        quiet_idx_intervals.append((start_idx, quiet_time_idx[-1]))
+
+        # convert to time intervals
+        left_quiet_times = time_vector[[start for start, _ in quiet_idx_intervals]]
+        right_quiet_times = time_vector[[end for _, end in quiet_idx_intervals]]
+
+    else:
+        print("[Info] No quiet periods found in convolved data.")
+    
     bursts_by_unit, non_bursts_by_unit, burst_durations, quiet_durations, warnings = {}, {}, {}, {}, []
     unit_data = {}
 
     for unit, spike_times in spike_times_by_unit.items():
+        # if unit == 9:
+        #     print(f"Skipping unit {unit} for debugging purposes.")
         spike_times = np.asarray(spike_times)
         bursts, non_bursts = {}, {}
         burst_id, quiet_id = 0, 0
@@ -4023,11 +5445,17 @@ def analyze_unit_activity(spike_times_by_unit, convolved_data):
                     warnings.append(f'Negative ISI in unit {unit} (burst {burst_id})')
             burst_id += 1
 
-        quiet_left = np.concatenate([[0], right_base_times[:-1]])
-        last_time = spike_times[-1] if spike_times.size > 0 else convolved_data['time_vector'][-1]
-        quiet_right = np.concatenate([left_base_times[1:], [last_time]])
+        # quiet_left = np.concatenate([[0], right_base_times[:-1]])
+        # last_time = spike_times[-1] if spike_times.size > 0 else convolved_data['time_vector'][-1]
+        # quiet_right = np.concatenate([left_base_times[1:], [last_time]])
 
-        for left, right in zip(quiet_left, quiet_right):
+        # rewriting this for testing, but maybe comment out soon.
+        # left_quiet_times = np.concatenate([[0], right_base_times[:-1]])
+        # last_time = spike_times[-1] if spike_times.size > 0 else convolved_data['time_vector'][-1]
+        # right_quiet_times = np.concatenate([left_base_times[1:], [last_time]])
+
+        #for left, right in zip(quiet_left, quiet_right):
+        for left, right in zip(left_quiet_times, right_quiet_times):
             quiet_spikes = spike_times[(spike_times >= left) & (spike_times <= right)]
             quiet_durations[quiet_id] = right - left
             if quiet_spikes.size > 0:
@@ -4056,7 +5484,17 @@ def analyze_unit_activity(spike_times_by_unit, convolved_data):
                 return dict.fromkeys(['data', 'mean', 'std', 'cov', 'median', 'min', 'max'], np.nan)
 
         def compute_fr(bursts, durations):
-            fr_data = {i: len(b) / durations[i] if durations[i] > 0 else np.nan for i, b in bursts.items()}
+            #fr_data = {i: len(b) / durations[i] if durations[i] > 0 else np.nan for i, b in bursts.items()}
+            fr_data ={}
+            for i, b in bursts.items():
+                if durations[i] > 0:
+                    if len(b) > 1: # need at least 2 spikes to compute a firing rate
+                        fr_data[i] = len(b) / durations[i]
+                    else:
+                        fr_data[i] = np.nan  # Not enough spikes to compute firing rate
+                else:
+                    fr_data[i] = np.nan
+                #if i==9:break
             valid_values = [v for v in fr_data.values() if not np.isnan(v)]
             return {
                 'data': fr_data,
@@ -4145,6 +5583,19 @@ def analyze_bursting_activity_v4(spike_times, spike_times_by_unit, min_peak_dist
     ''' 
     
     '''
+
+    def line_debug(ax):
+        # make sure there are lines in the ax
+        lines = ax.get_lines()
+        if len(lines) == 0:
+            print("No lines in ax")
+        else:
+            print(f"Number of lines in ax: {len(lines)}")
+            for line in lines:
+                print(f"Line: {line.get_label()}")
+        # check if there are any lines in the ax
+
+
     indent_increase()
     
     # init warnings
@@ -4227,11 +5678,11 @@ def analyze_bursting_activity_v4(spike_times, spike_times_by_unit, min_peak_dist
         indent_decrease()
         
         #debug - check if zero lines in ax
-        #line_debug(ax)
+        line_debug(ax)
         plt.close(fig)
         return {
             'ax': ax,
-            'convolved_data': convolved_data,
+            'convolved_data': convolved_data,            
             'unit_metrics': unit_metrics,
             'burst_metrics': burst_metrics,
             'warnings': {
@@ -4538,8 +5989,11 @@ def plot_network_activity_aw_dep(ax,SpikeTimes, min_peak_distance=1.0,
     #print(ax.getlines())
     #print(ax.get_lines()[0])
     
+    baseline = np.mean(firingRate)  # Calculate the baseline firing rate
+
     convolved_data = {
         'convolved_FR': firingRate,
+        'baseline': baseline,
         'peak_idxs': peaks,
         'peak_times': burstPeakTimes,
         'peak_values': burstPeakValues,
@@ -4622,18 +6076,55 @@ def plot_network_activity_aw(ax, SpikeTimes, min_peak_distance=1.0,
     burstPeakTimes = timeVector[peaks]
     burstPeakValues = firingRate[peaks]
 
+    # post process peaks, left and right bases
+    left_base_idxs = properties.get('left_bases', np.array([]))
+    right_base_idxs = properties.get('right_bases', np.array([]))
+    left_base_times = timeVector[left_base_idxs] if left_base_idxs.size > 0 else np.array([])
+    right_base_times = timeVector[right_base_idxs] if right_base_idxs.size > 0 else np.array([])
+
+
+    # # post process peaks, left and right bases
+    # peaks = peaks.copy()
+    # L = properties.get('left_bases', np.array([], dtype=int))
+    # R = properties.get('right_bases', np.array([], dtype=int))
+    # L_times = timeVector[L] if L.size > 0 else np.array([])
+    # R_times = timeVector[R] if R.size > 0 else np.array([])
+
+    # # 1. compute interval widths and sort by width (smallest first)
+    # widths = R - L
+    # widths_times = R_times - L_times
+    # order  = np.argsort(widths)
+
+    # kept = []
+    # for i in order:
+    #     li, ri = L[i], R[i]
+    #     # if this interval contains any already-kept peak, skip it
+    #     if any(li < peaks[j] < ri for j in kept):
+    #         continue
+    #     kept.append(i)
+
+    # kept = np.array(kept, dtype=int)
+
+
     ax.plot(burstPeakTimes, burstPeakValues, 'or')
+
+    baseline = np.mean(firingRate)
 
     convolved_data = {
         'convolved_FR': firingRate,
+        'baseline': baseline,
         'peak_idxs': peaks,
         'peak_times': burstPeakTimes,
         'peak_values': burstPeakValues,
         'prominences': properties.get('prominences', np.array([])),
-        'left_base_idxs': properties.get('left_bases', np.array([])),
-        'right_base_idxs': properties.get('right_bases', np.array([])),
-        'left_base_times': timeVector[properties['left_bases']] if 'left_bases' in properties else np.array([]),
-        'right_base_times': timeVector[properties['right_bases']] if 'right_bases' in properties else np.array([]),
+        #'left_base_idxs': properties.get('left_bases', np.array([])),
+        #'right_base_idxs': properties.get('right_bases', np.array([])),
+        #'left_base_times': timeVector[properties['left_bases']] if 'left_bases' in properties else np.array([]),
+        #'right_base_times': timeVector[properties['right_bases']] if 'right_bases' in properties else np.array([]),
+        'left_base_idxs': left_base_idxs,
+        'right_base_idxs': right_base_idxs,
+        'left_base_times': left_base_times,
+        'right_base_times': right_base_times,
         'time_vector': timeVector,
     }
 

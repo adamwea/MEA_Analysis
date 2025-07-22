@@ -13,6 +13,207 @@ import traceback
 
 import spikeinterface.postprocessing as spost
 import spikeinterface.full as si
+from scipy.spatial.distance import cdist
+
+from typing import Any, Dict, List, Tuple
+
+def extract_features_v3(
+    we: Any,
+    unit_ids: List[int],
+    network_data: Dict,
+    sorting_object: Any,
+    sampling_frequency: float = None
+    ) -> Tuple[List[List[float]], Dict[int, Dict[str, float]], List[int], Dict[int, Dict[str, Any]]]:
+    """
+    Extracts neuronal features related to bursting and firing patterns.
+    Includes all units, reports np.nan for features that can't be computed.
+    """
+    if sampling_frequency is None:
+        sampling_frequency = sorting_object.get_sampling_frequency()
+    
+    include_units = []
+    exclude_units = {}
+    exclusion_criteria = {'fr': 0.1, 'num_spikes': 50}
+    features = []
+    feature_dicts = {}
+
+    def safe_get(d, *keys, default=np.nan):
+        for k in keys:
+            try:
+                d = d.get(k, {})
+            except Exception:
+                return default
+        return d if isinstance(d, (int, float)) else default
+
+    for unit_id in unit_ids:
+        try:
+            spiking_data = network_data['spiking_data']['spiking_metrics_by_unit'].get(unit_id, {})
+            wf_metrics = spiking_data.get('wf_metrics', {})
+            burst_data = network_data.get('bursting_data', {}).get('unit_metrics', {}).get(unit_id, {})
+            mega_burst_data = network_data.get('mega_bursting_data', {}).get('unit_metrics', {}).get(unit_id, {})
+
+            num_spikes = spiking_data.get('num_spikes', 0)
+            fr = spiking_data.get('fr', np.nan)
+            isi = spiking_data.get('isi', {})
+
+            # Exclude wf metrics for units with insufficient data
+            exclude_wf_metrics = False
+            # flag for exclusion based on criteria
+            if fr < exclusion_criteria['fr']:
+                exclude_wf_metrics = True
+            if num_spikes < exclusion_criteria['num_spikes']:
+                exclude_wf_metrics = True
+
+            feature_dict = {
+                # Spikes
+                "fr": fr,
+                "isi_mean": isi.get('mean', np.nan),
+                "isi_std": isi.get('std', np.nan),
+                "isi_cov": isi.get('cov', np.nan),
+                "isi_median": isi.get('median', np.nan),
+
+                # Waveform variability
+                "mean_weighted_var": safe_get(wf_metrics, 'bio_variability_metrics', 'mean_variance'),
+                "std_weighted_var": safe_get(wf_metrics, 'bio_variability_metrics', 'std_variance'),
+                "cov_weighted_var": safe_get(wf_metrics, 'bio_variability_metrics', 'cov_variance'),
+                "mean_weighted_cov": safe_get(wf_metrics, 'bio_variability_metrics', 'mean_cv'),
+                "std_weighted_cov": safe_get(wf_metrics, 'bio_variability_metrics', 'std_cv'),
+                "cov_weighted_cov": safe_get(wf_metrics, 'bio_variability_metrics', 'cov_cv'),
+
+                # Amplitude
+                "peak_amplitude": safe_get(wf_metrics, 'amplitude_metrics', 'peak_amplitude'),
+                "trough_amplitude": safe_get(wf_metrics, 'amplitude_metrics', 'trough_amplitude'),
+                "peak_to_trough_amplitude": safe_get(wf_metrics, 'amplitude_metrics', 'peak_to_trough_amplitude'),
+
+                # Temporal
+                "trough_time_ms": safe_get(wf_metrics, 'temporal_metrics', 'trough_time_ms'),
+                "peak_time_ms": safe_get(wf_metrics, 'temporal_metrics', 'peak_time_ms'),
+                "peak_to_trough_time_ms": safe_get(wf_metrics, 'temporal_metrics', 'peak_to_trough_time_ms'),
+                "ap_phase_duration_ms": safe_get(wf_metrics, 'temporal_metrics', 'ap_phase_duration_ms'),
+                "ap_start_ms": safe_get(wf_metrics, 'temporal_metrics', 'ap_start_ms'),
+                "ap_end_ms": safe_get(wf_metrics, 'temporal_metrics', 'ap_end_ms'),
+                "refractory_phase_duration_ms": safe_get(wf_metrics, 'temporal_metrics', 'refractory_phase_duration_ms'),
+                "refractory_end_ms": safe_get(wf_metrics, 'temporal_metrics', 'refractory_end_ms'),
+                "spike_width_half_max_ms": safe_get(wf_metrics, 'temporal_metrics', 'spike_width_half_max_ms'),               
+
+                # Slope
+                "max_depolarization_slope": safe_get(wf_metrics, 'slope_metrics', 'max_depolarization_slope'),
+                "max_repolarization_slope": safe_get(wf_metrics, 'slope_metrics', 'max_repolarization_slope'),
+                "slope_ratio": safe_get(wf_metrics, 'slope_metrics', 'slope_ratio'),
+
+                # Asymmetry
+                "trough_to_peak_ratio": safe_get(wf_metrics, 'waveform_asymmetry', 'trough_to_peak_ratio'),
+                "waveform_asymmetry_index": safe_get(wf_metrics, 'waveform_asymmetry', 'waveform_asymmetry_index'),
+
+                # Energy
+                "ap_phase_power_uv2": safe_get(wf_metrics, 'energy_metrics', 'ap_phase_power_uv2'),
+                "refractory_phase_power_uv2": safe_get(wf_metrics, 'energy_metrics', 'refractory_phase_power_uv2'),
+                "total_spike_power_uv2": safe_get(wf_metrics, 'energy_metrics', 'total_spike_power_uv2'),
+
+                # Shape
+                "waveform_skewness": safe_get(wf_metrics, 'waveform_shape', 'waveform_skewness'),
+                "waveform_kurtosis": safe_get(wf_metrics, 'waveform_shape', 'waveform_kurtosis'),
+
+                # Vertical smearing
+                "cv_peak_amplitude": safe_get(wf_metrics, 'vertical_smearing', 'cv_peak_amplitude'),
+                "cv_trough_amplitude": safe_get(wf_metrics, 'vertical_smearing', 'cv_trough_amplitude'),
+                "peak_to_trough_variance": safe_get(wf_metrics, 'vertical_smearing', 'peak_to_trough_variance'),
+
+                # Horizontal smearing
+                "trough_time_std_ms": safe_get(wf_metrics, 'horizontal_smearing', 'trough_time_std_ms'),
+                "peak_time_std_ms": safe_get(wf_metrics, 'horizontal_smearing', 'peak_time_std_ms'),
+                "trough_to_peak_jitter_ms": safe_get(wf_metrics, 'horizontal_smearing', 'trough_to_peak_jitter_ms'),
+
+                # Bursting
+                "burst_part_rate": burst_data.get('burst_part_rate', np.nan),
+                "quiet_part_rate": burst_data.get('quiet_part_rate', np.nan),
+                "burst_part_perc": burst_data.get('burst_part_perc', np.nan),
+                "in_burst_fr_mean": safe_get(burst_data, 'fr', 'in_burst', 'mean'),
+                "in_burst_fr_std": safe_get(burst_data, 'fr', 'in_burst', 'std'),
+                "in_burst_fr_cov": safe_get(burst_data, 'fr', 'in_burst', 'cov'),
+                "out_burst_fr_mean": safe_get(burst_data, 'fr', 'out_burst', 'mean'),
+                "out_burst_fr_std": safe_get(burst_data, 'fr', 'out_burst', 'std'),
+                "out_burst_fr_cov": safe_get(burst_data, 'fr', 'out_burst', 'cov'),
+                "in_burst_isi_mean": safe_get(burst_data, 'isi', 'in_burst', 'mean'),
+                "in_burst_isi_std": safe_get(burst_data, 'isi', 'in_burst', 'std'),
+                "in_burst_isi_cov": safe_get(burst_data, 'isi', 'in_burst', 'cov'),
+                "out_burst_isi_mean": safe_get(burst_data, 'isi', 'out_burst', 'mean'),
+                "out_burst_isi_std": safe_get(burst_data, 'isi', 'out_burst', 'std'),
+                "out_burst_isi_cov": safe_get(burst_data, 'isi', 'out_burst', 'cov'),
+                "spike_count_in_burst_mean": safe_get(burst_data, 'spike_counts', 'in_burst', 'mean'),
+                "spike_count_in_burst_std": safe_get(burst_data, 'spike_counts', 'in_burst', 'std'),
+                "spike_count_in_burst_cov": safe_get(burst_data, 'spike_counts', 'in_burst', 'cov'),
+                "spike_count_out_burst_mean": safe_get(burst_data, 'spike_counts', 'out_burst', 'mean'),
+                "spike_count_out_burst_std": safe_get(burst_data, 'spike_counts', 'out_burst', 'std'),
+                "spike_count_out_burst_cov": safe_get(burst_data, 'spike_counts', 'out_burst', 'cov'),
+                "ff_in_burst": burst_data.get('fano_factor', {}).get('in_burst', np.nan),
+                "ff_out_burst": burst_data.get('fano_factor', {}).get('out_burst', np.nan),
+
+                # Mega bursting
+                "mega_burst_part_rate": mega_burst_data.get('burst_part_rate', np.nan),
+                "mega_quiet_part_rate": mega_burst_data.get('quiet_part_rate', np.nan),
+                "mega_burst_part_perc": mega_burst_data.get('burst_part_perc', np.nan),
+                "mega_in_burst_fr_mean": safe_get(mega_burst_data, 'fr', 'in_burst', 'mean'),
+                "mega_in_burst_fr_std": safe_get(mega_burst_data, 'fr', 'in_burst', 'std'),
+                "mega_in_burst_fr_cov": safe_get(mega_burst_data, 'fr', 'in_burst', 'cov'),
+                "mega_out_burst_fr_mean": safe_get(mega_burst_data, 'fr', 'out_burst', 'mean'),
+                "mega_out_burst_fr_std": safe_get(mega_burst_data, 'fr', 'out_burst', 'std'),
+                "mega_out_burst_fr_cov": safe_get(mega_burst_data, 'fr', 'out_burst', 'cov'),
+                "mega_in_burst_isi_mean": safe_get(mega_burst_data, 'isi', 'in_burst', 'mean'),
+                "mega_in_burst_isi_std": safe_get(mega_burst_data, 'isi', 'in_burst', 'std'),
+                "mega_in_burst_isi_cov": safe_get(mega_burst_data, 'isi', 'in_burst', 'cov'),
+                "mega_out_burst_isi_mean": safe_get(mega_burst_data, 'isi', 'out_burst', 'mean'),
+                "mega_out_burst_isi_std": safe_get(mega_burst_data, 'isi', 'out_burst', 'std'),
+                "mega_out_burst_isi_cov": safe_get(mega_burst_data, 'isi', 'out_burst', 'cov'),
+                "mega_spike_count_in_burst_mean": safe_get(mega_burst_data, 'spike_counts', 'in_burst', 'mean'),
+                "mega_spike_count_in_burst_std": safe_get(mega_burst_data, 'spike_counts', 'in_burst', 'std'),
+                "mega_spike_count_in_burst_cov": safe_get(mega_burst_data, 'spike_counts', 'in_burst', 'cov'),
+                "mega_spike_count_out_burst_mean": safe_get(mega_burst_data, 'spike_counts', 'out_burst', 'mean'),
+                "mega_spike_count_out_burst_std": safe_get(mega_burst_data, 'spike_counts', 'out_burst', 'std'),
+                "mega_spike_count_out_burst_cov": safe_get(mega_burst_data, 'spike_counts', 'out_burst', 'cov'),
+                "mega_ff_in_burst": mega_burst_data.get('fano_factor', {}).get('in_burst', np.nan),
+                "mega_ff_out_burst": mega_burst_data.get('fano_factor', {}).get('out_burst', np.nan),
+            }
+
+            if exclude_wf_metrics:
+                # remove waveform metrics from feature_dict
+                wf_keys = ['mean_weighted_var', 'std_weighted_var', 'cov_weighted_var',
+                            'mean_weighted_cov', 'std_weighted_cov', 'cov_weighted_cov',
+                            'peak_amplitude', 'trough_amplitude', 'peak_to_trough_amplitude',
+                            'trough_time_ms', 'peak_time_ms', 'peak_to_trough_time_ms',
+                            'ap_phase_duration_ms', 'ap_start_ms', 'ap_end_ms',
+                            'refractory_phase_duration_ms', 'refractory_end_ms',
+                            'spike_width_half_max_ms', 'max_depolarization_slope',
+                            'max_repolarization_slope', 'slope_ratio', 'trough_to_peak_ratio',
+                            'waveform_asymmetry_index', 'ap_phase_power_uv2',
+                            'refractory_phase_power_uv2', 'total_spike_power_uv2',
+                            'waveform_skewness', 'waveform_kurtosis',
+                            'cv_peak_amplitude', 'cv_trough_amplitude',
+                            'peak_to_trough_variance', 'trough_time_std_ms',
+                            'peak_time_std_ms', 'trough_to_peak_jitter_ms']
+                for key in wf_keys:
+                    feature_dict[key] = np.nan
+
+            feature_dicts[unit_id] = feature_dict
+            features.append(list(feature_dict.values()))
+
+            if fr < exclusion_criteria['fr']:
+                exclude_units[unit_id] = {'reason': 'low_fr', 'fr': fr, 'num_spikes': num_spikes}
+            elif num_spikes < exclusion_criteria['num_spikes']:
+                exclude_units[unit_id] = {'reason': 'low_num_spikes', 'num_spikes': num_spikes, 'fr': fr}
+            else:
+                include_units.append(unit_id)
+
+        except Exception as e:
+            print(f"Error extracting features for unit {unit_id}: {e}")
+            traceback.print_exc()
+            feature_dicts[unit_id] = {k: np.nan for k in feature_dict.keys()}
+            exclude_units[unit_id] = {'reason': 'error', 'error': str(e)}
+
+    print(f'{len(exclude_units)} units excluded based on feature extraction')
+    print(f'{len(include_units)} units included based on feature extraction')
+
+    return features, feature_dicts, include_units, exclude_units
 
 def check_features(feature_dict):
     """Check feature values for issues and report problematic feature names."""
@@ -341,7 +542,82 @@ def extract_features_v2(we, unit_ids, network_data, sorting_object, sampling_fre
     print(f'{len(exclude_units)} units excluded based on feature extraction')
     print(f'{len(include_units)} units included based on feature extraction')
     return features, feature_dicts, include_units, exclude_units
+
+def post_hoc_clustering(features_pca, feature_dicts, exclude_units, cluster_labels, scaler, pca, kmeans, network_data):
+    """
+    Assigns excluded units to clusters using nearest centroid in PCA space.
+    Excludes units that fired once or not at all.
+    Returns updated features_pca, cluster_labels, and feature_dicts.
+    Prints summary of assignments.
+    """
+    import numpy as np
+    from scipy.spatial.distance import cdist
+
+    centroids = kmeans.cluster_centers_
+    new_features_pca = []
+    new_labels = []
+    feature_vector_length = scaler.mean_.shape[0] // 2  # original feature length (before nan mask)
     
+    added_unit_ids = []
+    cluster_counts = {}
+    skipped_fires_once = 0
+
+    for unit_id in exclude_units.keys():
+
+        partial_features = feature_dicts[unit_id]
+
+        #partial_features = [fr, ff] + [np.nan] * (feature_vector_length - 2)
+        #partial_features = feature_dict.values()
+        #raw_feature_vector = np.array(partial_features)
+        raw_feature_vector = np.array([partial_features.get(key, np.nan) for key in sorted(partial_features.keys())])
+
+        # nan_mask = np.isnan(raw_feature_vector).astype(float)
+        # raw_feature_vector = np.nan_to_num(raw_feature_vector, nan=0.0)
+        # augmented_vector = np.hstack((raw_feature_vector, nan_mask))
+        nan_mask = np.isnan(raw_feature_vector).astype(float)
+        raw_feature_vector = np.nan_to_num(raw_feature_vector, nan=0.0)
+        augmented_vector = np.hstack((raw_feature_vector, nan_mask))
+
+
+        # Scale and PCA project
+        #scaled = scaler.transform([augmented_vector])
+        #pca_projected = pca.transform(scaled)
+        scaled = scaler.transform([feature_vector])
+        pca_projected = pca.transform(scaled)
+
+        # Assign to closest cluster
+        distances = cdist(pca_projected, centroids)
+        assigned_label = np.argmin(distances)
+
+        # Collect info
+        new_features_pca.append(pca_projected[0])
+        new_labels.append(assigned_label)
+        added_unit_ids.append(unit_id)
+        cluster_counts[assigned_label] = cluster_counts.get(assigned_label, 0) + 1
+
+        # Store minimal feature info
+        # feature_dicts[unit_id] = {
+        #     'fr': fr,
+        #     'ff_in_burst': ff
+        # }
+        feature_dicts[unit_id] = feature_dict  # Store full feature dict for consistency
+
+    # Merge
+    if new_features_pca:
+        features_pca = np.vstack((features_pca, np.array(new_features_pca)))
+        cluster_labels = np.hstack((cluster_labels, np.array(new_labels)))
+
+        print(f"[Post-Hoc Clustering] Assigned {len(added_unit_ids)} previously excluded units.")
+        for cluster_id, count in cluster_counts.items():
+            print(f"  → Cluster {cluster_id}: {count} units")
+    else:
+        print("[Post-Hoc Clustering] No excluded units were added.")
+
+    if skipped_fires_once > 0:
+        print(f"[Post-Hoc Clustering] Skipped {skipped_fires_once} units that fired only once or not at all.")
+
+    return features_pca, cluster_labels, feature_dicts
+
 def classify(network_data, plot_wfs=False, **kwargs):
     '''
     Classifies neurons into clusters based on multiple waveform and burst activity features.
@@ -360,7 +636,7 @@ def classify(network_data, plot_wfs=False, **kwargs):
     ## ** Extract Features from Spiking and Bursting Analysis **
     unit_ids = sorting_object.get_unit_ids()
     
-    features, feature_dicts, include_units, exclude_units = extract_features_v2(wfs, unit_ids, network_data, sorting_object, sampling_frequency)    
+    features, feature_dicts, include_units, exclude_units = extract_features_v3(wfs, unit_ids, network_data, sorting_object, sampling_frequency)    
     
     ## ** Feature Scaling and Dimensionality Reduction **
     
@@ -373,20 +649,50 @@ def classify(network_data, plot_wfs=False, **kwargs):
     # Create NaN indicators to preserve missing information
     nan_mask = np.isnan(features).astype(float)  # 1 for NaN, 0 for non-NaN
     features_with_nan_info = np.hstack((features, nan_mask))  # Append mask as extra features
+    features = features_with_nan_info
     
     # Replace all nans with 0
     features = np.nan_to_num(features, nan=0.0)
     
-    # Normalize features
+    # parse features by included and excluded units
+    include_features = []
+    exclude_features = []
+    for unit_idx, unit_id in enumerate(feature_dicts.keys()):
+        if unit_id in include_units:
+            include_features.append(features[unit_idx])
+        elif unit_id in exclude_units:
+            exclude_features.append(features[unit_idx])
+    include_features = np.array(include_features)
+    exclude_features = np.array(exclude_features)
+    print(f'Extracted features for {len(include_units)} included units and {len(exclude_units)} excluded units')
+    
+    # Normalize included features
     scaler = StandardScaler()
-    features_scaled = scaler.fit_transform(features)
+    features_scaled = scaler.fit_transform(include_features)
+    #features_scaled = scaler.fit_transform(features)
+
+    # # Normalize features
+    # scaler = StandardScaler()
+    # features_scaled = scaler.fit_transform(features)
+
+    # # parse features by included and excluded units
+    # include_features = []
+    # exclude_features = []
+    # for unit_idx, unit_id in enumerate(feature_dicts.keys()):
+    #     if unit_id in include_units:
+    #         include_features.append(features_scaled[unit_idx])
+    #     elif unit_id in exclude_units:
+    #         exclude_features.append(features_scaled[unit_idx])
+    # include_features = np.array(include_features)
+    # exclude_features = np.array(exclude_features)
+    # print(f'Extracted features for {len(include_units)} included units and {len(exclude_units)} excluded units')
     
     # Reduce dimensionality using PCA (keep 2 components)
     explained_variance = None
     n_components = 2
     while explained_variance is None or explained_variance < 0.9:
 
-        pca = PCA(n_components=n_components)
+        pca = PCA(n_components=n_components, svd_solver='full') # svd_solver='full' is used to ensure that PCA results are consistent across different runs
         features_pca = pca.fit_transform(features_scaled)
         explained_variance = np.sum(pca.explained_variance_ratio_)
         
@@ -399,10 +705,35 @@ def classify(network_data, plot_wfs=False, **kwargs):
     #check how well n_components=2 captures variance
     print(f"Explained variance ratio: {pca.explained_variance_ratio_}")
     
+    # Extract feature names from feature_dicts (assuming consistent order)
+    feature_names = list(feature_dicts[next(iter(feature_dicts))].keys())
+    feature_names_with_nan_info = feature_names + [f"{name}_nan" for name in feature_names]  # Append nan mask names
+
+    # Recover absolute component weights from PCA
+    component_weights = np.abs(pca.components_)  # shape: (n_components, n_features)
+    num_top_features = 10  # adjust this as needed
+
+    # Collect top informative features by name per component
+    informative_features = {}
+    for i, comp in enumerate(component_weights[:3]):  # top 3 components
+        top_indices = np.argsort(comp)[-num_top_features:][::-1]
+        top_names = [feature_names_with_nan_info[idx] for idx in top_indices]
+        informative_features[f'PC{i+1}'] = top_names
+
+    # Display results
+    # informative_df = pd.DataFrame(informative_features)
+    # print("\nTop informative feature names per principal component:")
+    # print(informative_df.to_string(index=False))
+    print("\nTop informative feature names per principal component:")
+    for pc, names in informative_features.items():
+        print(f"{pc}: {', '.join(names)}")
+
+
+
     #TODO: loop here, add PCA components until explained variance is > 0.9
     
     # Apply K-means clustering
-    kmeans = KMeans(n_clusters=2)
+    kmeans = KMeans(n_clusters=2, random_state=42, n_init='auto')  # n_init='auto' is used to ensure that KMeans results are consistent across different runs
     cluster_labels = kmeans.fit_predict(features_pca)
     
     # Outlier Removal Using Mahalanobis Distance
@@ -422,18 +753,118 @@ def classify(network_data, plot_wfs=False, **kwargs):
         #redefine
         cluster_labels = cluster_labels_filtered
         features_pca = features_pca_filtered
-    
+
+    # post-hoc clustering of excluded units
+    # post-hoc clustering of excluded units
+    # enable_post_hoc_clustering = True
+    # if enable_post_hoc_clustering:
+    #     features_pca, cluster_labels, feature_dicts = post_hoc_clustering(
+    #         features_pca, feature_dicts, exclude_units, cluster_labels,
+    #         scaler, pca, kmeans, network_data,
+    #         #inhibitory_cluster, excitatory_cluster
+    #     )
+
+    # post hoc clustering of excluded units
+    # enable_post_hoc_clustering = True
+        # if enable_post_hoc_clustering:
+        #     for unit_idx, unit_id in enumerate(exclude_units.keys()):
+        #         features = feature_dicts[unit_id]
+        #         unit_spiking_data = network_data['spiking_data']['spiking_metrics_by_unit'].get(unit_id, {})
+
+        #         #only categorize by fr
+        #         #fr = features.get('fr', np.nan)
+        #         #ff = features.get('ff_in_burst', np.nan)
+        #         #mega_ff = features.get('mega_ff_in_burst', np.nan)
+        #         # apparently most informative features:
+        #         # PC1: 
+        #         ## burst_part_perc, burst_part_rate, mega_quiet_part_rate, 
+        #         ## mega_in_burst_isi_std, in_burst_isi_std, quiet_part_rate, 
+        #         ## isi_std, mega_burst_part_perc, mega_burst_part_rate, spike_count_in_burst_std
+        #         #PC2: mega_out_burst_fr_cov_nan, mega_out_burst_fr_mean_nan, 
+        #         ## mega_out_burst_isi_cov_nan, mega_out_burst_isi_std_nan, mega_out_burst_isi_mean_nan, 
+        #         ## mega_out_burst_fr_std_nan, mega_out_burst_isi_std, spike_count_out_burst_std_nan, 
+        #         ## ff_out_burst_nan, spike_count_out_burst_mean_nan
+        #         selected_features = [
+        #             # pc 1
+        #             'burst_part_perc', 'burst_part_rate', 'mega_quiet_part_rate',
+        #             'mega_in_burst_isi_std', 'in_burst_isi_std', 'quiet_part_rate',
+        #             'isi_std', 'mega_burst_part_perc', 'mega_burst_part_rate', 'spike_count_in_burst_std'
+
+        #             # pc 2 is mostly nan mask info, so adding the relevant features
+        #             'mega_out_burst_fr_cov', 'mega_out_burst_fr_mean',
+        #             'mega_out_burst_isi_cov', 'mega_out_burst_isi_std', 'mega_out_burst_isi_mean',
+        #             'mega_out_burst_fr_std', 'mega_out_burst_isi_std',
+        #             'spike_count_out_burst_std', 'ff_out_burst', 'spike_count_out_burst_mean'
+        #         ]
+                
+        #         unmasked_feature_vector_length = len(feature_dicts[unit_id])
+        #         #unscaled_feature_vector = [fr] + [np.nan] * (unmasked_feature_vector_length - 1)
+        #         #unscaled_feature_vector = [fr, ff, mega_ff] + [np.nan] * (unmasked_feature_vector_length - 3)
+        #         unscaled_feature_vector = []
+        #         for key, feature in feature_dicts[unit_id].items():
+        #             if key in selected_features:
+        #                 unscaled_feature_vector.append(feature)
+        #             else:
+        #                 unscaled_feature_vector.append(np.nan)
+
+
+        #         # nan mask
+        #         nan_mask = np.isnan(unscaled_feature_vector).astype(float)
+        #         unscaled_feature_vector = np.nan_to_num(unscaled_feature_vector, nan=0.0)
+        #         unscaled_feature_vector = np.hstack((unscaled_feature_vector, nan_mask))
+
+        #         #unscaled_feature_vector = exclude_features[unit_idx]
+        #         scaled = scaler.transform([unscaled_feature_vector])
+        #         pca_projected = pca.transform(scaled)
+
+        #         # Assign to closest cluster
+        #         distances = cdist(pca_projected, centroids)
+        #         assigned_label = np.argmin(distances)
+
+        #         #print(f"Unit {unit_id}:")
+        #         #print(f"Unit {unit_id} assigned to cluster {assigned_label} in post-hoc clustering")
+        #         #print(f"Distances to centroids: {distances}")
+        #         print(f"Unit {unit_id} assigned to cluster {assigned_label} in post-hoc clustering (euclidean distance)")
+
+        #         # predict with kmeans
+        #         assigned_label = kmeans.predict(pca_projected)[0]
+        #         print(f"Unit {unit_id} assigned to cluster {assigned_label} in post-hoc clustering (KMeans predict)")
+
+        #         # preidct with mahalanobis distance
+        #         cov = np.cov(pca_projected.T)
+        #         eps = 1e-6  # small regularization constant
+        #         cov += np.eye(cov.shape[0]) * eps
+        #         VI = np.linalg.inv(cov)
+        #         distances = [mahalanobis(pca_projected[0], centroid, VI) for centroid in centroids]
+        #         assigned_label_mahalanobis = np.argmin(distances)
+        #         print(f"Unit {unit_id} assigned to cluster {assigned_label_mahalanobis} in post-hoc clustering (Mahalanobis distance)")
+
+        #         # correlation distance
+        #         from scipy.spatial.distance import correlation
+        #         distances = [correlation(pca_projected[0], centroid) for centroid in centroids]
+        #         assigned_label_correlation = np.argmin(distances)
+        #         print(f"Unit {unit_id} assigned to cluster {assigned_label_correlation} in post-hoc clustering (Correlation distance)")
+
+        #         # cityblock
+        #         from scipy.spatial.distance import cityblock
+
+        #         distances = [cityblock(pca_projected[0], centroid) for centroid in centroids]
+        #         assigned_label_cityblock = np.argmin(distances)
+        #         print(f"Unit {unit_id} assigned to cluster {assigned_label_cityblock} in post-hoc clustering (Cityblock distance)")
+
     # check which cluster has higher mean firing rate - assume this is the inhibitory cluster
     cluster_1_frs = []
     cluster_2_frs = []
     cluster_1_ffs = []
     cluster_2_ffs = []
+    included_feature_dicts = {unit_id: feature_dicts[unit_id] for unit_id in include_units}
+    #included_feature_dicts = feature_dicts
     for i in range(2):
         #frs.append(np.mean(features[cluster_labels == i, 2]))
-        for unit_idx, unit_id in enumerate(feature_dicts.keys()):
+        for unit_idx, unit_id in enumerate(included_feature_dicts.keys()):
             designated_cluster = cluster_labels[unit_idx]
-            fr = feature_dicts[unit_id]['fr']
-            ff = feature_dicts[unit_id]['ff_in_burst']
+            fr = included_feature_dicts[unit_id]['fr']
+            ff = included_feature_dicts[unit_id]['ff_in_burst']
             if designated_cluster == 0:
                 #cluster_1_frs.append(fr)
                 cluster_1_frs.append(fr)
@@ -447,40 +878,40 @@ def classify(network_data, plot_wfs=False, **kwargs):
     if verbose:
         
         #
-        mean_fr_cluster_1 = np.mean(cluster_1_frs)
-        max_fr_cluster_1 = np.max(cluster_1_frs)
-        min_fr_cluster_1 = np.min(cluster_1_frs)
-        cov_fr_cluster_1 = np.std(cluster_1_frs) / mean_fr_cluster_1
+        mean_fr_cluster_1 = np.nanmean(cluster_1_frs)
+        max_fr_cluster_1 = np.nanmax(cluster_1_frs)
+        min_fr_cluster_1 = np.nanmin(cluster_1_frs)
+        cov_fr_cluster_1 = np.nanstd(cluster_1_frs) / mean_fr_cluster_1
         # print in multiple lines
         print(f"Cluster 1 FR: {mean_fr_cluster_1:.2f} Hz")
         print(f"Max FR: {max_fr_cluster_1:.2f} Hz")
         print(f"Min FR: {min_fr_cluster_1:.2f} Hz")
         print(f"CoV FR: {cov_fr_cluster_1:.2f}")
         
-        mean_ff_cluster_1 = np.mean(cluster_1_ffs)
-        max_ff_cluster_1 = np.max(cluster_1_ffs)
-        min_ff_cluster_1 = np.min(cluster_1_ffs)
-        cov_ff_cluster_1 = np.std(cluster_1_ffs) / mean_ff_cluster_1
+        mean_ff_cluster_1 = np.nanmean(cluster_1_ffs)
+        max_ff_cluster_1 = np.nanmax(cluster_1_ffs)
+        min_ff_cluster_1 = np.nanmin(cluster_1_ffs)
+        cov_ff_cluster_1 = np.nanstd(cluster_1_ffs) / mean_ff_cluster_1
         # print in multiple lines
         print(f"Cluster 1 FF: {mean_ff_cluster_1:.2f}")
         print(f"Max FF: {max_ff_cluster_1:.2f}")
         print(f"Min FF: {min_ff_cluster_1:.2f}")
         print(f"CoV FF: {cov_ff_cluster_1:.2f}")
         
-        mean_fr_cluster_2 = np.mean(cluster_2_frs)
-        max_fr_cluster_2 = np.max(cluster_2_frs)
-        min_fr_cluster_2 = np.min(cluster_2_frs)
-        cov_fr_cluster_2 = np.std(cluster_2_frs) / mean_fr_cluster_2
+        mean_fr_cluster_2 = np.nanmean(cluster_2_frs)
+        max_fr_cluster_2 = np.nanmax(cluster_2_frs)
+        min_fr_cluster_2 = np.nanmin(cluster_2_frs)
+        cov_fr_cluster_2 = np.nanstd(cluster_2_frs) / mean_fr_cluster_2
         # print in multiple lines
         print(f"Cluster 2 FR: {mean_fr_cluster_2:.2f} Hz")
         print(f"Max FR: {max_fr_cluster_2:.2f} Hz")
         print(f"Min FR: {min_fr_cluster_2:.2f} Hz")
         print(f"CoV FR: {cov_fr_cluster_2:.2f}")
         
-        mean_ff_cluster_2 = np.mean(cluster_2_ffs)
-        max_ff_cluster_2 = np.max(cluster_2_ffs)
-        min_ff_cluster_2 = np.min(cluster_2_ffs)
-        cov_ff_cluster_2 = np.std(cluster_2_ffs) / mean_ff_cluster_2
+        mean_ff_cluster_2 = np.nanmean(cluster_2_ffs)
+        max_ff_cluster_2 = np.nanmax(cluster_2_ffs)
+        min_ff_cluster_2 = np.nanmin(cluster_2_ffs)
+        cov_ff_cluster_2 = np.nanstd(cluster_2_ffs) / mean_ff_cluster_2
         # print in multiple lines
         print(f"Cluster 2 FF: {mean_ff_cluster_2:.2f}")
         print(f"Max FF: {max_ff_cluster_2:.2f}")
@@ -495,15 +926,15 @@ def classify(network_data, plot_wfs=False, **kwargs):
         centroids = kmeans.cluster_centers_
         for cluster_label in unique_cluster_labels:
             cluster_metrics[cluster_label] = {
-                'centroid': centroids[cluster_label],
-                'mean_fr': np.mean(cluster_1_frs) if cluster_label == 0 else np.mean(cluster_2_frs),
-                'mean_ff': np.mean(cluster_1_ffs) if cluster_label == 0 else np.mean(cluster_2_ffs),
-                'max_fr': np.max(cluster_1_frs) if cluster_label == 0 else np.max(cluster_2_frs),
-                'max_ff': np.max(cluster_1_ffs) if cluster_label == 0 else np.max(cluster_2_ffs),
-                'min_fr': np.min(cluster_1_frs) if cluster_label == 0 else np.min(cluster_2_frs),
-                'min_ff': np.min(cluster_1_ffs) if cluster_label == 0 else np.min(cluster_2_ffs),
-                'cov_fr': np.std(cluster_1_frs) / np.mean(cluster_1_frs) if cluster_label == 0 else np.std(cluster_2_frs) / np.mean(cluster_2_frs),
-                'cov_ff': np.std(cluster_1_ffs) / np.mean(cluster_1_ffs) if cluster_label == 0 else np.std(cluster_2_ffs) / np.mean(cluster_2_ffs)
+            'centroid': centroids[cluster_label],
+            'mean_fr': np.nanmean(cluster_1_frs) if cluster_label == 0 else np.nanmean(cluster_2_frs),
+            'mean_ff': np.nanmean(cluster_1_ffs) if cluster_label == 0 else np.nanmean(cluster_2_ffs),
+            'max_fr': np.nanmax(cluster_1_frs) if cluster_label == 0 else np.nanmax(cluster_2_frs),
+            'max_ff': np.nanmax(cluster_1_ffs) if cluster_label == 0 else np.nanmax(cluster_2_ffs),
+            'min_fr': np.nanmin(cluster_1_frs) if cluster_label == 0 else np.nanmin(cluster_2_frs),
+            'min_ff': np.nanmin(cluster_1_ffs) if cluster_label == 0 else np.nanmin(cluster_2_ffs),
+            'cov_fr': np.nanstd(cluster_1_frs) / np.nanmean(cluster_1_frs) if cluster_label == 0 else np.nanstd(cluster_2_frs) / np.nanmean(cluster_2_frs),
+            'cov_ff': np.nanstd(cluster_1_ffs) / np.nanmean(cluster_1_ffs) if cluster_label == 0 else np.nanstd(cluster_2_ffs) / np.nanmean(cluster_2_ffs)
             }
             
         mean_fr_all_clusters = [cluster_metrics[cluster_label]['mean_fr'] for cluster_label in unique_cluster_labels]
@@ -596,7 +1027,8 @@ def classify(network_data, plot_wfs=False, **kwargs):
     # ** Store Classification Results **
     # init dict
     #classified_units = {unit_id: {'desc': cluster_descriptions[i]} for i, unit_id in enumerate(feature_dicts.keys())}
-    classified_units = {unit_id: {'desc': cluster_metrics[cluster_labels[unit_idx]]['description']} for unit_idx, unit_id in enumerate(feature_dicts.keys())}
+    #classified_units = {unit_id: {'desc': cluster_metrics[cluster_labels[unit_idx]]['description']} for unit_idx, unit_id in enumerate(feature_dicts.keys())}
+    classified_units = {unit_id: {'desc': cluster_info_dict['cluster_metrics'][cluster_labels[i]]['description']} for i, unit_id in enumerate(included_feature_dicts.keys())}
     
     # add data to dict
     for unit in classified_units.keys():

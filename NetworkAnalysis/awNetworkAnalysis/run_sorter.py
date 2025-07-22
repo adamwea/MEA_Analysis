@@ -67,6 +67,7 @@ def run_sorter(
             output_folder = os.path.join(sorted_output_dir, wellid) #same filepath structure as the raw data + wellid
             
             # try to load the kilosort2 results if they already exist
+            try_load = False
             load_success = False
             if try_load:
                 print(f'try_load is true. Attempting to load kilosort2 results for {wellid}...')

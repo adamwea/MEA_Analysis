@@ -276,16 +276,24 @@ def plot_raster(ax, spiking_data_by_unit, unit_types=None, x_lim=None):
     gid_to_ypos = {gid: pos for pos, gid in enumerate(sorted_units)}
     
     # Plot the units in the sorted order
+    markersize = 1  # Smallest visible marker size for points
+    alpha = .1  # Transparency for better visibility
     if unit_types is None:
         for gid in sorted_units:
             spike_times = spiking_data_by_unit[gid]['spike_times']
             spike_times = [spike_times] if isinstance(spike_times, (int, float)) else spike_times
             if spike_times is not None:
-                ax.plot(spike_times, [gid_to_ypos[gid]] * len(spike_times), 'b.', markersize=2)
+                ax.plot(spike_times, [gid_to_ypos[gid]] * len(spike_times), linestyle='None', marker='.', color='b', markersize=markersize, 
+                        alpha=alpha
+                        )
     else:
-        # Define legend markers for excitatory (E) and inhibitory (I) units
-        exc_marker, = ax.plot([], [], 'b.', markersize=2, label='Excitatory (E)')
-        inh_marker, = ax.plot([], [], 'r.', markersize=2, label='Inhibitory (I)')
+        # Define legend markers for excitatory (E) and inhibitory (I) units as points
+        exc_marker, = ax.plot([], [], linestyle='None', marker='.', color='b', markersize=markersize, 
+                              #alpha=alpha, 
+                              label='Excitatory (E)')
+        inh_marker, = ax.plot([], [], linestyle='None', marker='.', color='r', markersize=markersize, 
+                              #alpha=alpha, 
+                              label='Inhibitory (I)')
 
         for gid in sorted_units:
             spike_times = spiking_data_by_unit[gid]['spike_times']

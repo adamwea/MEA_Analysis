@@ -1,0 +1,1 @@
+pip install -e /global/homes/a/adammwea/dev/MEA_Analysis/NetworkAnalysisTools
